@@ -184,3 +184,70 @@ fn detection_survives_min_severity_gate() {
         .collect();
     assert!(!criticals.is_empty(), "at least one CRITICAL event expected");
 }
+
+#[test]
+fn kill_enforcement_terminates_on_exploitation() {
+    // In --kill mode the simulator must be SIGKILLed the moment it issues the
+    // injected socket() — it never gets to exit cleanly on its own.
+    use wraith::detect::Enforcement;
+    let bin = env!("CARGO_BIN_EXE_shellcode-sim");
+    let cfg = Config { enforcement: Enforcement::Kill, ..Config::default() };
+    let Some((events, summary)) = trace(bin, cfg) else {
+        return; // ptrace unavailable — skip
+    };
+
+    assert!(
+        events.iter().any(|e| e.kind == Kind::Killed),
+        "expected a `killed` enforcement event, got: {:?}",
+        events.iter().map(|e| e.to_line(false)).collect::<Vec<_>>()
+    );
+    // Killed by SIGKILL (9) before it could exit normally.
+    assert_eq!(
+        summary.term_signal,
+        Some(libc::SIGKILL),
+        "target should be terminated by SIGKILL, summary: {summary:?}"
+    );
+    assert_eq!(summary.exit_code, None, "a killed target has no clean exit code");
+    assert_eq!(summary.max_severity, Some(Severity::Critical));
+}
+
+#[test]
+fn block_enforcement_neutralizes_but_lets_process_live() {
+    // In --block mode the injected socket() is cancelled (returns -ENOSYS), so
+    // the simulator survives and exits cleanly, but a `blocked` event proves
+    // the exploit syscall was neutralised.
+    use wraith::detect::Enforcement;
+    let bin = env!("CARGO_BIN_EXE_shellcode-sim");
+    let cfg = Config { enforcement: Enforcement::Block, ..Config::default() };
+    let Some((events, summary)) = trace(bin, cfg) else {
+        return;
+    };
+
+    assert!(
+        events.iter().any(|e| e.kind == Kind::Blocked),
+        "expected a `blocked` enforcement event, got: {:?}",
+        events.iter().map(|e| e.to_line(false)).collect::<Vec<_>>()
+    );
+    // The exploitation was still detected...
+    assert_eq!(summary.max_severity, Some(Severity::Critical));
+    // ...but the process was allowed to finish rather than killed.
+    assert_eq!(
+        summary.exit_code,
+        Some(0),
+        "blocked target should run to a clean exit, summary: {summary:?}"
+    );
+    assert_eq!(summary.term_signal, None);
+}
+
+#[test]
+fn observe_mode_never_intervenes() {
+    // The default mode must not emit enforcement events — detection only.
+    let bin = env!("CARGO_BIN_EXE_shellcode-sim");
+    let Some((events, _)) = trace(bin, Config::default()) else {
+        return;
+    };
+    assert!(
+        !events.iter().any(|e| matches!(e.kind, Kind::Blocked | Kind::Killed)),
+        "observe mode must not enforce"
+    );
+}

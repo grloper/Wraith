@@ -48,6 +48,11 @@ pub enum Kind {
     /// The target took a fatal signal (SIGSEGV/SIGILL/SIGBUS/SIGABRT) — often
     /// the visible symptom of a memory-corruption attempt that missed.
     Crash,
+    /// Enforcement neutralised the offending syscall in place (`--block`): the
+    /// kernel was told to skip it and return an error.
+    Blocked,
+    /// Enforcement killed the traced tree on confirmed exploitation (`--kill`).
+    Killed,
 }
 
 impl Kind {
@@ -60,6 +65,8 @@ impl Kind {
             Kind::SensitiveCall => "sensitive_call",
             Kind::ExploitationChain => "exploitation_chain",
             Kind::Crash => "crash",
+            Kind::Blocked => "blocked",
+            Kind::Killed => "killed",
         }
     }
 }

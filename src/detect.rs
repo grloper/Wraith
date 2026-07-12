@@ -13,6 +13,26 @@ use crate::maps::MemoryMap;
 use crate::provenance::{classify_rip, classify_rsp, Origin, Prot, StackState};
 use crate::syscalls;
 
+/// What Wraith does when it is confident it has caught exploitation (a
+/// CRITICAL event). Detection is always on; enforcement decides whether Wraith
+/// also intervenes to stop the attack in its tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enforcement {
+    /// Detect and report only — never touch the tracee. The default, and the
+    /// only mode that is guaranteed side-effect-free.
+    #[default]
+    Observe,
+    /// Neutralise the offending syscall in place: at its entry stop the syscall
+    /// number is overwritten so the kernel skips it and returns an error, so
+    /// the injected code's `execve`/`connect`/… never actually runs. The
+    /// process keeps going, which is useful when you want it to survive (and
+    /// log what it does next) rather than die.
+    Block,
+    /// `SIGKILL` the whole traced tree the instant exploitation is confirmed,
+    /// before the offending syscall executes.
+    Kill,
+}
+
 /// Tunable behaviour.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -24,6 +44,16 @@ pub struct Config {
     pub detect_stack_pivot: bool,
     /// Emit INFO breadcrumbs for sensitive syscalls from legitimate origins.
     pub audit_sensitive: bool,
+    /// Half-open `[start, end)` address ranges the operator vouches for as
+    /// legitimate JIT / runtime-generated code. A syscall whose instruction
+    /// pointer — or an `mmap`/`mprotect` whose target page — falls inside one
+    /// of these is exempt from the provenance and W^X rules, so a known JIT
+    /// engine can be monitored without drowning the operator in false
+    /// positives. Empty by default, so it changes nothing unless asked for.
+    pub trusted_regions: Vec<(u64, u64)>,
+    /// Whether (and how) to actively stop confirmed exploitation. See
+    /// [`Enforcement`].
+    pub enforcement: Enforcement,
 }
 
 impl Default for Config {
@@ -32,7 +62,18 @@ impl Default for Config {
             jit_is_critical: false,
             detect_stack_pivot: true,
             audit_sensitive: false,
+            trusted_regions: Vec::new(),
+            enforcement: Enforcement::Observe,
         }
+    }
+}
+
+impl Config {
+    /// True when `addr` sits inside an operator-trusted JIT region.
+    pub fn is_trusted(&self, addr: u64) -> bool {
+        self.trusted_regions
+            .iter()
+            .any(|&(start, end)| addr >= start && addr < end)
     }
 }
 
@@ -107,9 +148,11 @@ impl Detector {
             }
         }
 
-        // 1. Provenance of the syscall instruction itself.
+        // 1. Provenance of the syscall instruction itself. A trusted JIT
+        //    region is exempt: the operator has vouched that runtime-generated
+        //    code lives there, so a syscall from it is not evidence of injection.
         let origin = classify_rip(map, ctx.rip);
-        if origin.is_anomalous() {
+        if origin.is_anomalous() && !cfg.is_trusted(ctx.rip) {
             chain.foreign_origin = true;
             let sensitive = syscalls::is_sensitive(ctx.nr);
             let severity = foreign_severity(cfg, origin, sensitive);
@@ -166,11 +209,15 @@ impl Detector {
         }
 
         // 3. W^X: pages requested/made writable-and-executable, or flipped
-        //    from writable to executable (payload staging).
+        //    from writable to executable (payload staging). A page inside a
+        //    trusted JIT region is exempt — JIT engines legitimately map
+        //    writable-then-executable code there.
         if syscalls::is_mmap(ctx.nr) || syscalls::is_mprotect(ctx.nr) {
             let prot = Prot::from_raw(ctx.args[2]);
             let addr = ctx.args[0];
-            if prot.is_wx() {
+            if cfg.is_trusted(addr) {
+                // Operator-vouched JIT page; not payload staging.
+            } else if prot.is_wx() {
                 chain.wx_staged = true;
                 events.push(Event::now(
                     ctx.pid,
@@ -343,6 +390,55 @@ mod tests {
         let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(ev.iter().any(|e| e.kind == Kind::ExploitationChain
             && e.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn trusted_region_suppresses_foreign_origin() {
+        // The RWX page at 0x7f0000030000 would normally be flagged, but if the
+        // operator vouches for it as a JIT region the syscall from it is silent.
+        let cfg = Config {
+            trusted_regions: vec![(0x7f0000030000, 0x7f0000031000)],
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        let ev = d.on_syscall(1, &ctx(1, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        assert!(ev.is_empty(), "trusted JIT region must not raise a foreign-origin event");
+    }
+
+    #[test]
+    fn trusted_region_suppresses_wx_and_chain() {
+        // A JIT that maps RWX inside its trusted range, then runs a sensitive
+        // syscall from it, must not escalate — no W^X event, no chain.
+        let cfg = Config {
+            trusted_regions: vec![(0x7f0000030000, 0x7f0000031000)],
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+        let staging = d.on_syscall(
+            1,
+            &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000030000, 0x1000, prot, 0, 0, 0]),
+            &map(),
+        );
+        assert!(staging.is_empty(), "W^X inside a trusted region must be exempt");
+        let firing = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        assert!(
+            firing.is_empty(),
+            "a sensitive syscall from a trusted region must not escalate, got: {firing:?}"
+        );
+    }
+
+    #[test]
+    fn untrusted_page_outside_range_still_flagged() {
+        // A trusted range must not blanket-trust the whole address space: the
+        // RWX page outside it is still caught.
+        let cfg = Config {
+            trusted_regions: vec![(0x400000, 0x401000)],
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        assert!(ev.iter().any(|e| e.kind == Kind::ForeignOriginSyscall));
     }
 
     #[test]

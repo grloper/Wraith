@@ -62,6 +62,9 @@ cargo build --release
 # Monitor a process that's already running:
 sudo ./target/release/wraith attach 4242
 
+# Monitor every process matching a name at once:
+sudo ./target/release/wraith scan --match nginx
+
 # Emit machine-readable events for your SIEM/pipeline:
 ./target/release/wraith run --json events.jsonl -- ./target
 ```
@@ -104,15 +107,93 @@ catches every stage and correlates them into one verdict.
 | `crash` | HIGH | Target took SIGSEGV/SIGILL/SIGBUS/SIGABRT — often a *failed* exploit worth investigating. |
 | `exploitation_chain` | CRITICAL | Multiple primitives correlated into a single high-confidence verdict. |
 | `sensitive_call` | INFO | Audit breadcrumb (with `--audit-sensitive`): a sensitive syscall from legitimate code. |
+| `blocked` | CRITICAL | Enforcement neutralised the offending syscall in place (`--block`). |
+| `killed` | CRITICAL | Enforcement killed the traced tree on confirmed exploitation (`--kill`). |
 
 Tuning:
 
 ```
 --jit-critical      treat anonymous-exec pages as HIGH (targets that never JIT)
+--trust-region A-B  treat the hex range [A,B) as legitimate JIT (repeatable)
 --no-stack-pivot    disable the ROP stack-pivot heuristic
 --audit-sensitive   log sensitive syscalls from legitimate code too
 --min <sev>         floor: info|warn|high|critical (default warn)
 ```
+
+---
+
+## Active response (enforcement)
+
+By default Wraith only *detects* — it never touches the tracee. Because it sits
+at the syscall-entry stop, though, it is standing at the one moment the
+offending syscall has not yet run, so it can also *stop* the attack:
+
+```bash
+# Neutralise the offending syscall in place — the injected code's execve/connect
+# returns an error and never takes effect; the process lives on so you can watch
+# what it does next.
+wraith run --block -- ./target
+
+# Terminate the whole traced tree the instant exploitation is confirmed, before
+# the offending syscall executes.
+wraith run --kill  -- ./target
+```
+
+Both fire only on a **CRITICAL** verdict — injected code issuing a *sensitive*
+syscall, or a correlated exploitation chain — so a HIGH/WARN anomaly (a JIT
+page, a lone RWX mapping) never trips enforcement. `--block` overwrites the
+syscall number at its entry stop so the kernel skips it and returns `-ENOSYS`;
+`--kill` sends `SIGKILL` to every traced thread-group.
+
+### Trusting a JIT
+
+Language runtimes (Node.js, the JVM, .NET, browsers) execute JIT-compiled code
+from anonymous executable pages and flip writable pages to executable as they
+compile — behaviour that looks, syscall-for-syscall, like payload staging. When
+you know where a runtime places its code, hand Wraith the range and it treats
+provenance and W^X inside it as legitimate:
+
+```bash
+# Trust one or more JIT arenas (repeat --trust-region as needed).
+wraith run --trust-region 7f2a10000000-7f2a14000000 -- ./node-service
+```
+
+Trust applies to concrete addresses — the syscall's execution site and an
+`mprotect` target page — so a JIT that respects W^X (map RW, write, `mprotect`
+RX) is fully exempted, while a *direct* RWX allocation elsewhere is still
+flagged.
+
+---
+
+## Scanning many processes at once
+
+`run` and `attach` watch a single process tree. `scan` attaches to a whole set
+of already-running processes in one shot — select them by name/cmdline
+substring, or take everything you have permission to trace:
+
+```bash
+# Attach to every process whose name or command line contains "nginx"
+# (repeat --match to widen the net); follows the children they spawn too.
+sudo wraith scan --match nginx --match redis
+
+# Attach to every process we're allowed to trace (heavy — see below).
+sudo wraith scan --all --min high
+```
+
+One tracer drives all of them through a single reap loop, and enforcement
+(`--block`/`--kill`) and the JSON stream work exactly as they do for a single
+target. Caveats worth knowing:
+
+- **Needs privilege.** Attaching to a process you don't own requires
+  `CAP_SYS_PTRACE` (run as root); processes you can't attach to are skipped, not
+  fatal.
+- **It has a cost.** Every traced process pays the two-stops-per-syscall
+  `ptrace` tax, so `--all` on a busy host is expensive — prefer `--match`.
+  Whole-system, near-zero-overhead monitoring is the eBPF backend's job (below).
+- **Non-destructive by default.** Unlike `run`, `scan`/`attach` do *not* set
+  `PTRACE_O_EXITKILL`: stopping Wraith leaves every scanned process running.
+- **Post-attach threads only.** As with `attach`, sibling threads that already
+  existed before Wraith attached aren't picked up automatically (see below).
 
 ---
 
@@ -129,7 +210,7 @@ carry the smallest supply chain you can manage. The engine links only `nix` and
    ├─ syscalls.rs    the syscall table Wraith cares about
    ├─ detect.rs      the invariants + the exploitation-chain correlator
    ├─ event.rs       detection events + their JSONL form
-   ├─ tracer.rs      the ptrace engine (spawn/attach, thread-following loop)
+   ├─ tracer.rs      the ptrace engine (spawn/attach/scan, thread-following, enforcement)
    └─ bin/
        ├─ wraith.rs           the CLI sensor
        ├─ benign.rs           false-positive control target
@@ -173,12 +254,20 @@ claim to be a finished EDR.
   provenance rule — that's what the stack-pivot heuristic is for, and why
   return-address validation and a shadow stack are on the roadmap.
 - **Legitimate JIT** (browsers, JVMs, .NET) runs code from anonymous
-  executable pages; hence `AnonExec` is WARN by default and configurable.
+  executable pages; hence `AnonExec` is WARN by default, `AnonExec` can be
+  raised with `--jit-critical`, and known JIT arenas can be exempted outright
+  with `--trust-region`.
+- **Coverage vs. cost.** `scan --match`/`--all` can watch many processes at
+  once, but every traced process pays the two-stops-per-syscall `ptrace` tax, so
+  this suits a handful of high-value targets rather than a busy whole system.
+  Near-zero-overhead, watch-everything monitoring is the eBPF backend's job (see
+  below), not something the `ptrace` engine should attempt.
 
-Roadmap: eBPF backend · return-address/shadow-stack checks · ROP-chain length
-heuristics · per-thread stack tracking · seizing pre-existing threads on attach
-· per-process behavioural baselining · a policy DSL for allow-listing
-legitimate JIT regions.
+Roadmap: eBPF backend (near-zero-overhead, system-wide) · return-address/
+shadow-stack checks · ROP-chain length heuristics · per-thread stack tracking ·
+seizing pre-existing threads on attach · per-process behavioural baselining ·
+richer JIT policy (auto-learn a runtime's arenas rather than hand-supplied
+ranges).
 
 ---
 
@@ -186,7 +275,7 @@ legitimate JIT regions.
 
 ```bash
 cargo build --release
-cargo test          # 28 unit + 6 end-to-end tests
+cargo test          # 36 unit + 9 end-to-end tests
 cargo clippy --all-targets
 ./demo.sh           # side-by-side benign vs. exploitation run
 ```
