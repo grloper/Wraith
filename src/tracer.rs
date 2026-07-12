@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::time::{Duration, Instant};
 
 use nix::sys::ptrace;
 use nix::sys::signal::{kill, Signal};
@@ -81,6 +82,70 @@ impl Summary {
             Some(cur) => cur.max(ev.severity),
             None => ev.severity,
         });
+    }
+}
+
+/// Live, per-process statistics surfaced to a [`Reporter`] during a run, so a
+/// UI can show what each traced process is doing in real time. Keyed by
+/// thread-group id — one entry per address space, matching how detection is
+/// scoped — so every thread of a process rolls up into one row.
+#[derive(Debug, Clone)]
+pub struct ProcStat {
+    pub tgid: i32,
+    pub name: String,
+    pub syscalls: u64,
+    pub events: u64,
+    pub max_severity: Option<Severity>,
+    pub alive: bool,
+}
+
+impl ProcStat {
+    fn new(tgid: i32) -> Self {
+        ProcStat {
+            tgid,
+            name: read_comm(tgid),
+            syscalls: 0,
+            events: 0,
+            max_severity: None,
+            alive: true,
+        }
+    }
+
+    fn record(&mut self, ev: &Event) {
+        self.events += 1;
+        self.max_severity = Some(match self.max_severity {
+            Some(cur) => cur.max(ev.severity),
+            None => ev.severity,
+        });
+    }
+}
+
+/// The sink for a run's output. Detection events arrive via [`Reporter::event`];
+/// an implementor that also wants live progress overrides [`Reporter::wants_refresh`]
+/// to return `true` and paints in [`Reporter::refresh`]. The defaults make a
+/// plain event-only consumer (a logging closure, the test harness) pay nothing
+/// for progress machinery it doesn't use — the engine skips building snapshots
+/// entirely when no one is watching.
+pub trait Reporter {
+    /// One detection fired.
+    fn event(&mut self, ev: &Event);
+    /// Whether this reporter wants periodic [`refresh`](Reporter::refresh)
+    /// snapshots. Default `false`.
+    fn wants_refresh(&self) -> bool {
+        false
+    }
+    /// A periodic snapshot of every traced process and the running aggregate.
+    /// Only called when [`wants_refresh`](Reporter::wants_refresh) is `true`.
+    fn refresh(&mut self, _stats: &[ProcStat], _summary: &Summary) {}
+}
+
+/// Adapts a plain `FnMut(&Event)` closure into a [`Reporter`], so the common
+/// "just hand me events" callers keep working unchanged through [`Tracer::run`].
+struct FnReporter<F>(F);
+
+impl<F: FnMut(&Event)> Reporter for FnReporter<F> {
+    fn event(&mut self, ev: &Event) {
+        (self.0)(ev)
     }
 }
 
@@ -223,10 +288,22 @@ impl Tracer {
 
     /// Run the trace to completion — following every thread and child the
     /// target(s) spawn — invoking `on_event` for every detection. The trace
-    /// ends once the last tracee has exited.
-    pub fn run<F>(mut self, mut on_event: F) -> io::Result<Summary>
+    /// ends once the last tracee has exited. This is the plain, event-only
+    /// entry point; for a live progress UI, see [`Tracer::run_with`].
+    pub fn run<F>(self, on_event: F) -> io::Result<Summary>
     where
         F: FnMut(&Event),
+    {
+        self.run_with(FnReporter(on_event))
+    }
+
+    /// Run the trace to completion, driving an arbitrary [`Reporter`]. The
+    /// engine feeds it every detection and — when it asks via
+    /// [`Reporter::wants_refresh`] — periodic per-process snapshots for a live
+    /// display. The trace ends once the last tracee has exited.
+    pub fn run_with<R>(mut self, mut reporter: R) -> io::Result<Summary>
+    where
+        R: Reporter,
     {
         let mut summary = Summary::default();
 
@@ -238,10 +315,13 @@ impl Tracer {
             Target::ScanAttached(pids) => (pids.clone(), None),
         };
 
-        // Per-thread phase, and per-address-space (tgid) cached maps. Threads
-        // that share memory share an `AddrSpace` entry.
+        // Per-thread phase, per-address-space (tgid) cached maps, and per-process
+        // live stats. Threads that share memory share an `AddrSpace` and a
+        // `ProcStat` entry.
         let mut threads: HashMap<i32, ThreadState> = HashMap::new();
         let mut spaces: HashMap<i32, AddrSpace> = HashMap::new();
+        let mut stats: HashMap<i32, ProcStat> = HashMap::new();
+        let mut last_refresh = Instant::now();
 
         // Seed every initial tracee and kick each toward its first syscall stop.
         for p in &initial {
@@ -249,8 +329,10 @@ impl Tracer {
             let tgid = read_tgid(raw);
             threads.insert(raw, ThreadState { at_entry: true, tgid });
             spaces.entry(tgid).or_insert_with(AddrSpace::new);
+            stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
             ptrace::syscall(*p, None).map_err(nix_err)?;
         }
+        refresh(&mut reporter, &stats, &summary, &mut last_refresh, true);
 
         loop {
             // Reap any tracee. `ECHILD` means every thread and child has gone.
@@ -271,27 +353,35 @@ impl Tracer {
                 let tgid = read_tgid(raw);
                 slot.insert(ThreadState { at_entry: true, tgid });
                 spaces.entry(tgid).or_insert_with(AddrSpace::new);
+                stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
                 // Consume this initial stop and let the new tracee run; the
                 // creation SIGSTOP must not be forwarded.
                 let _ = ptrace::syscall(who, None);
+                refresh(&mut reporter, &stats, &summary, &mut last_refresh, true);
                 continue;
             }
 
             match status {
                 WaitStatus::Exited(_, code) => {
+                    let tgid = threads.get(&raw).map(|t| t.tgid);
                     threads.remove(&raw);
                     if Some(raw) == root_pid {
                         summary.exit_code = Some(code);
                     }
+                    mark_dead_if_last(&mut stats, &threads, tgid);
+                    refresh(&mut reporter, &stats, &summary, &mut last_refresh, true);
                     if threads.is_empty() {
                         break;
                     }
                 }
                 WaitStatus::Signaled(_, sig, _) => {
+                    let tgid = threads.get(&raw).map(|t| t.tgid);
                     threads.remove(&raw);
                     if Some(raw) == root_pid {
                         summary.term_signal = Some(sig as i32);
                     }
+                    mark_dead_if_last(&mut stats, &threads, tgid);
+                    refresh(&mut reporter, &stats, &summary, &mut last_refresh, true);
                     if threads.is_empty() {
                         break;
                     }
@@ -299,29 +389,33 @@ impl Tracer {
                 WaitStatus::PtraceSyscall(_) => {
                     let tgid = threads[&raw].tgid;
                     let mut killed = false;
+                    let mut event_fired = false;
                     if threads[&raw].at_entry {
                         summary.syscalls_seen += 1;
                         let space = spaces.entry(tgid).or_insert_with(AddrSpace::new);
-                        let step = self.inspect(who, tgid, space, &mut summary, &mut on_event);
-                        if let Some(nr) = step.nr {
+                        let stat = stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
+                        stat.syscalls += 1;
+                        let step = self.inspect(who, tgid, space, &mut summary, stat, &mut reporter);
+                        event_fired = step.max_severity.is_some();
+                        let is_mem = step.nr.map(syscalls::is_memory_op).unwrap_or(false);
+                        let critical = step.max_severity == Some(Severity::Critical);
+                        // `space` and `stat` borrows end above; safe to re-borrow.
+                        if is_mem {
                             // A memory op by any thread can change the shared
                             // address space; invalidate the whole group's map.
-                            if syscalls::is_memory_op(nr) {
-                                spaces.get_mut(&tgid).unwrap().dirty = true;
-                            }
+                            spaces.get_mut(&tgid).unwrap().dirty = true;
                         }
                         // Enforce only on a confirmed exploitation (CRITICAL),
                         // and only at the syscall's entry stop — the one moment
                         // the offending syscall has not yet run.
-                        if self.enforcement != Enforcement::Observe
-                            && step.max_severity == Some(Severity::Critical)
-                        {
+                        if self.enforcement != Enforcement::Observe && critical {
+                            let stat = stats.get_mut(&tgid).unwrap();
                             match self.enforcement {
                                 Enforcement::Block => {
-                                    self.block_syscall(who, &mut summary, &mut on_event)
+                                    self.block_syscall(who, &mut summary, stat, &mut reporter)
                                 }
                                 Enforcement::Kill => {
-                                    self.kill_tree(who, &threads, &mut summary, &mut on_event);
+                                    self.kill_tree(who, &threads, &mut summary, stat, &mut reporter);
                                     killed = true;
                                 }
                                 Enforcement::Observe => {}
@@ -339,13 +433,18 @@ impl Tracer {
                     } else {
                         ptrace::syscall(who, None).map_err(nix_err)?;
                     }
+                    // Repaint immediately on a detection, else at a throttled rate.
+                    refresh(&mut reporter, &stats, &summary, &mut last_refresh, event_fired);
                 }
                 WaitStatus::Stopped(_, sig) => {
                     // A real signal was delivered to the tracee (not a syscall
                     // stop). Fatal memory-safety signals are worth surfacing as
                     // a possible failed exploit, then we forward the signal.
-                    self.on_signal(who, sig, &mut summary, &mut on_event);
+                    let tgid = threads[&raw].tgid;
+                    let stat = stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
+                    let fired = self.on_signal(who, sig, &mut summary, stat, &mut reporter);
                     ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
+                    refresh(&mut reporter, &stats, &summary, &mut last_refresh, fired);
                 }
                 WaitStatus::PtraceEvent(_, _, _) => {
                     // Clone/fork/exec notification for a tracee we already know;
@@ -356,22 +455,25 @@ impl Tracer {
                 WaitStatus::StillAlive => {}
             }
         }
+        // A final frame so the last state is on screen before we return.
+        refresh(&mut reporter, &stats, &summary, &mut last_refresh, true);
         Ok(summary)
     }
 
     /// Inspect a single syscall-entry stop for thread `who` in address space
     /// `space`, reporting the syscall number and the highest severity it
     /// raised so the caller can decide whether to enforce.
-    fn inspect<F>(
+    fn inspect<R>(
         &mut self,
         who: Pid,
         tgid: i32,
         space: &mut AddrSpace,
         summary: &mut Summary,
-        on_event: &mut F,
+        stat: &mut ProcStat,
+        reporter: &mut R,
     ) -> Inspection
     where
-        F: FnMut(&Event),
+        R: Reporter,
     {
         let Ok(regs) = ptrace::getregs(who) else {
             return Inspection { nr: None, max_severity: None };
@@ -404,7 +506,8 @@ impl Tracer {
         for ev in self.detector.on_syscall(tgid, &ctx, current) {
             max_severity = Some(max_severity.map_or(ev.severity, |cur: Severity| cur.max(ev.severity)));
             summary.record(&ev);
-            on_event(&ev);
+            stat.record(&ev);
+            reporter.event(&ev);
         }
         Inspection { nr: Some(nr), max_severity }
     }
@@ -413,9 +516,9 @@ impl Tracer {
     /// syscall number with an invalid value: the kernel then skips the call and
     /// returns `-ENOSYS`, so the injected code's action never takes effect. The
     /// tracee lives on, which is what `--block` is for.
-    fn block_syscall<F>(&self, who: Pid, summary: &mut Summary, on_event: &mut F)
+    fn block_syscall<R>(&self, who: Pid, summary: &mut Summary, stat: &mut ProcStat, reporter: &mut R)
     where
-        F: FnMut(&Event),
+        R: Reporter,
     {
         let Ok(mut regs) = ptrace::getregs(who) else { return };
         let syscall = syscalls::name(regs.orig_rax);
@@ -438,21 +541,23 @@ impl Tracer {
             format!("neutralised `{syscall}` from injected code before it executed (--block)"),
         );
         summary.record(&ev);
-        on_event(&ev);
+        stat.record(&ev);
+        reporter.event(&ev);
     }
 
     /// `SIGKILL` every thread-group under trace. Sending the signal to a group
     /// leader (a tgid) tears down all of its threads at once, so the offending
     /// process — and every sibling we are following — dies before the syscall
     /// we stopped at can run.
-    fn kill_tree<F>(
+    fn kill_tree<R>(
         &self,
         who: Pid,
         threads: &HashMap<i32, ThreadState>,
         summary: &mut Summary,
-        on_event: &mut F,
+        stat: &mut ProcStat,
+        reporter: &mut R,
     ) where
-        F: FnMut(&Event),
+        R: Reporter,
     {
         let (syscall, rip, rsp) = ptrace::getregs(who)
             .map(|r| (syscalls::name(r.orig_rax), r.rip.wrapping_sub(2), r.rsp))
@@ -478,19 +583,29 @@ impl Tracer {
             format!("killed traced process tree on `{syscall}` from injected code (--kill)"),
         );
         summary.record(&ev);
-        on_event(&ev);
+        stat.record(&ev);
+        reporter.event(&ev);
     }
 
-    fn on_signal<F>(&self, pid: Pid, sig: Signal, summary: &mut Summary, on_event: &mut F)
+    /// Surface a fatal memory-safety signal as a possible failed exploit.
+    /// Returns whether an event was emitted (so the caller can force a repaint).
+    fn on_signal<R>(
+        &self,
+        pid: Pid,
+        sig: Signal,
+        summary: &mut Summary,
+        stat: &mut ProcStat,
+        reporter: &mut R,
+    ) -> bool
     where
-        F: FnMut(&Event),
+        R: Reporter,
     {
         let fatal = matches!(
             sig,
             Signal::SIGSEGV | Signal::SIGILL | Signal::SIGBUS | Signal::SIGABRT
         );
         if !fatal {
-            return;
+            return false;
         }
         let (rip, rsp) = ptrace::getregs(pid)
             .map(|r| (r.rip, r.rsp))
@@ -508,7 +623,9 @@ impl Tracer {
             ),
         );
         summary.record(&ev);
-        on_event(&ev);
+        stat.record(&ev);
+        reporter.event(&ev);
+        true
     }
 }
 
@@ -541,6 +658,57 @@ fn status_pid(status: &WaitStatus) -> Option<Pid> {
         | WaitStatus::PtraceSyscall(p)
         | WaitStatus::Continued(p) => Some(*p),
         WaitStatus::StillAlive => None,
+    }
+}
+
+/// The short `comm` name of a process (e.g. `nginx`), read once. Falls back to
+/// the pid rendered as a string when `/proc/<pid>/comm` is unreadable.
+fn read_comm(pid: i32) -> String {
+    match fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => pid.to_string(),
+    }
+}
+
+/// Push a live snapshot to the reporter. When `force` is false the paint is
+/// throttled to ~20 fps so a syscall-heavy target doesn't spend its time
+/// redrawing; `force` (a detection, a process lifecycle change, the final
+/// frame) always paints. Skipped entirely — no snapshot built — when the
+/// reporter doesn't want progress, so the plain event path costs nothing.
+fn refresh<R: Reporter>(
+    reporter: &mut R,
+    stats: &HashMap<i32, ProcStat>,
+    summary: &Summary,
+    last: &mut Instant,
+    force: bool,
+) {
+    if !reporter.wants_refresh() {
+        return;
+    }
+    let now = Instant::now();
+    if !force && now.duration_since(*last) < Duration::from_millis(50) {
+        return;
+    }
+    *last = now;
+    let mut snap: Vec<ProcStat> = stats.values().cloned().collect();
+    snap.sort_by_key(|s| s.tgid);
+    reporter.refresh(&snap, summary);
+}
+
+/// Mark a process dead once its last thread has gone. `tgid` is the group the
+/// just-exited thread belonged to; if no surviving thread shares it, the
+/// process is finished and its row flips to "exited".
+fn mark_dead_if_last(
+    stats: &mut HashMap<i32, ProcStat>,
+    threads: &HashMap<i32, ThreadState>,
+    tgid: Option<i32>,
+) {
+    if let Some(tgid) = tgid {
+        if !threads.values().any(|t| t.tgid == tgid) {
+            if let Some(s) = stats.get_mut(&tgid) {
+                s.alive = false;
+            }
+        }
     }
 }
 

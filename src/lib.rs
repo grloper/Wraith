@@ -38,6 +38,7 @@
 //! - [`detect`] — the rules and the exploitation-chain correlator.
 //! - [`event`] — detection events and their JSON form.
 //! - [`tracer`] — the `ptrace` engine that drives a target.
+//! - [`ui`] — the live terminal dashboard (`--ui`).
 
 pub mod detect;
 pub mod event;
@@ -45,7 +46,9 @@ pub mod maps;
 pub mod provenance;
 pub mod syscalls;
 pub mod tracer;
+pub mod ui;
 
-pub use detect::{Config, Detector, SyscallCtx};
+pub use detect::{Config, Detector, Enforcement, SyscallCtx};
 pub use event::{Event, Kind, Severity};
-pub use tracer::{Summary, Tracer};
+pub use tracer::{ProcStat, Reporter, Summary, Tracer};
+pub use ui::{Dashboard, TerminalGuard};

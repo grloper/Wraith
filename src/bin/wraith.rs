@@ -14,6 +14,7 @@
 //!   --kill               SIGKILL the traced tree on detection
 //!   --match <substr>     (scan) attach to processes whose name/cmdline matches
 //!   --all                (scan) attach to every process we're allowed to trace
+//!   --ui                 live full-screen dashboard instead of the log stream
 //!   --no-stack-pivot     disable the ROP stack-pivot heuristic
 //!   --audit-sensitive    also log sensitive syscalls from legitimate code
 //!   --quiet              suppress the human event stream (use with --json)
@@ -26,6 +27,7 @@ use std::process::ExitCode;
 use wraith::detect::{Config, Enforcement};
 use wraith::event::{Event, Severity};
 use wraith::tracer::Tracer;
+use wraith::ui::{Dashboard, TerminalGuard};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -42,6 +44,7 @@ struct Opts {
     json: Option<String>,
     min: Severity,
     quiet: bool,
+    ui: bool,
     cfg: Config,
 }
 
@@ -58,6 +61,7 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         json: None,
         min: Severity::Warn,
         quiet: false,
+        ui: false,
         cfg: Config::default(),
     };
 
@@ -98,6 +102,7 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                 scan_matches.push(v.clone());
             }
             "--all" => scan_all = true,
+            "--ui" | "--dashboard" => opts.ui = true,
             "--no-stack-pivot" => opts.cfg.detect_stack_pivot = false,
             "--audit-sensitive" => opts.cfg.audit_sensitive = true,
             "--quiet" => opts.quiet = true,
@@ -114,45 +119,52 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
 
     // Set up output sinks.
     let color = io::stderr().is_terminal();
-    let mut json_sink: Option<Box<dyn Write>> = match opts.json.as_deref() {
+    let json_sink: Option<Box<dyn Write>> = match opts.json.as_deref() {
         None => None,
         Some("-") => Some(Box::new(io::stdout())),
         Some(path) => Some(Box::new(File::create(path)?)),
     };
     let min = opts.min;
     let quiet = opts.quiet;
+    let ui = opts.ui;
+    let enforcement = opts.cfg.enforcement;
 
-    let mut on_event = |ev: &Event| {
-        if ev.severity >= min {
-            if !quiet {
-                let _ = writeln!(io::stderr(), "{}", ev.to_line(color));
-            }
-            if let Some(sink) = json_sink.as_mut() {
-                let _ = writeln!(sink, "{}", ev.to_json());
-            }
-        }
-    };
+    if ui && !io::stderr().is_terminal() {
+        return Err(bad(
+            "--ui needs an interactive terminal on stderr; drop --ui, or use --json for a stream",
+        ));
+    }
 
-    let enforce_note = match opts.cfg.enforcement {
+    let enforce_note = match enforcement {
         Enforcement::Observe => "",
         Enforcement::Block => " [enforcing: block]",
         Enforcement::Kill => " [enforcing: kill]",
     };
+
+    // A short label for the run, used by the dashboard header. Assigned by
+    // every non-returning arm below.
+    let ui_label;
 
     let tracer = match mode.as_str() {
         "run" => {
             if target.is_empty() {
                 return Err(bad("no program to run; use: wraith run -- <program> [args...]"));
             }
-            eprintln!(
-                "wraith: monitoring `{}` (provenance mode){enforce_note}",
-                target.join(" ")
-            );
+            ui_label = format!("run — {}", target.join(" "));
+            if !ui {
+                eprintln!(
+                    "wraith: monitoring `{}` (provenance mode){enforce_note}",
+                    target.join(" ")
+                );
+            }
             Tracer::spawn(&target, opts.cfg)?
         }
         "attach" => {
             let pid = attach_pid.ok_or_else(|| bad("attach needs a pid"))?;
-            eprintln!("wraith: attaching to pid {pid}{enforce_note}");
+            ui_label = format!("attach — pid {pid}");
+            if !ui {
+                eprintln!("wraith: attaching to pid {pid}{enforce_note}");
+            }
             Tracer::attach(pid, opts.cfg)?
         }
         "scan" => {
@@ -165,15 +177,18 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
             if pids.is_empty() {
                 return Err(bad("scan matched no running processes"));
             }
-            eprintln!(
-                "wraith: scanning {} process(es){}{enforce_note}",
-                pids.len(),
-                if scan_all {
-                    " (--all)".to_string()
-                } else {
-                    format!(" matching {scan_matches:?}")
-                },
-            );
+            let filter = if scan_all {
+                "--all".to_string()
+            } else {
+                format!("--match {}", scan_matches.join(","))
+            };
+            ui_label = format!("scan {filter}");
+            if !ui {
+                eprintln!(
+                    "wraith: scanning {} process(es) {filter}{enforce_note}",
+                    pids.len(),
+                );
+            }
             Tracer::attach_many(&pids, opts.cfg)?
         }
         other => {
@@ -183,7 +198,27 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         }
     };
 
-    let summary = tracer.run(&mut on_event)?;
+    let summary = if ui {
+        // Live dashboard: the tracer drives a Dashboard reporter inside a guard
+        // that restores the terminal on exit (and on Ctrl-C via a signal handler).
+        let dash = Dashboard::new(ui_label, enforcement, min, json_sink);
+        let _guard = TerminalGuard::enter()?;
+        tracer.run_with(dash)?
+    } else {
+        // Plain stream: colored log lines to stderr, optional JSONL to the sink.
+        let mut json_sink = json_sink;
+        let mut on_event = |ev: &Event| {
+            if ev.severity >= min {
+                if !quiet {
+                    let _ = writeln!(io::stderr(), "{}", ev.to_line(color));
+                }
+                if let Some(sink) = json_sink.as_mut() {
+                    let _ = writeln!(sink, "{}", ev.to_json());
+                }
+            }
+        };
+        tracer.run(&mut on_event)?
+    };
 
     // A short verdict on stderr so a human sees the bottom line.
     eprintln!(
@@ -212,11 +247,13 @@ fn verdict(sev: Option<Severity>) -> &'static str {
 }
 
 /// Walk `/proc` and return the PIDs to scan. A process is selected when `all`
-/// is set, or when any `needle` is a substring of its `comm` or `cmdline`. The
-/// scanner's own PID and PID 1 are always excluded; the attach itself (in
-/// [`Tracer::attach_many`]) skips anything we lack permission to trace.
+/// is set, or when any `needle` is a substring of its `comm` or `cmdline`. Our
+/// own process, its whole ancestor chain (the shell/terminal that launched us),
+/// and PID 1 are excluded — a `scan` should watch its targets, never the tools
+/// that started it. The attach itself (in [`Tracer::attach_many`]) then skips
+/// anything we lack permission to trace.
 fn enumerate_scan_pids(needles: &[String], all: bool) -> Vec<i32> {
-    let self_pid = std::process::id() as i32;
+    let excluded = ancestor_pids();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return out;
@@ -226,7 +263,7 @@ fn enumerate_scan_pids(needles: &[String], all: bool) -> Vec<i32> {
         let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
             continue;
         };
-        if pid == self_pid || pid == 1 {
+        if pid == 1 || excluded.contains(&pid) {
             continue;
         }
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
@@ -239,6 +276,37 @@ fn enumerate_scan_pids(needles: &[String], all: bool) -> Vec<i32> {
         }
     }
     out
+}
+
+/// The set of PIDs from us up to the root of the process tree — our own PID and
+/// every ancestor. Used to keep `scan` from attaching to the shell, terminal,
+/// or supervisor that launched it (which would otherwise match a broad filter
+/// and, being long-lived, keep the trace running forever).
+fn ancestor_pids() -> std::collections::HashSet<i32> {
+    let mut set = std::collections::HashSet::new();
+    let mut pid = std::process::id() as i32;
+    // Bounded walk: real trees are shallow, and this guards against a cycle.
+    for _ in 0..128 {
+        if !set.insert(pid) {
+            break;
+        }
+        match read_ppid(pid) {
+            Some(ppid) if ppid > 1 => pid = ppid,
+            _ => break,
+        }
+    }
+    set
+}
+
+/// The parent PID of `pid` from `/proc/<pid>/status`, if readable.
+fn read_ppid(pid: i32) -> Option<i32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
 }
 
 /// Pure predicate: does a process with this `comm`/`cmdline` pass the filter?
@@ -298,6 +366,7 @@ OPTIONS:\n  \
 --kill               SIGKILL the traced tree on exploitation (CRITICAL)\n  \
 --match <substr>     (scan) attach to processes whose name/cmdline matches (repeatable)\n  \
 --all                (scan) attach to every process we're allowed to trace\n  \
+--ui                 live full-screen dashboard (per-process rows + event feed)\n  \
 --no-stack-pivot     disable the ROP stack-pivot heuristic\n  \
 --audit-sensitive    also log sensitive syscalls from legitimate code\n  \
 --quiet              suppress the human stream (pair with --json)\n  \
