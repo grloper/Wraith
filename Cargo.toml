@@ -25,6 +25,17 @@ path = "src/bin/benign.rs"
 name = "shellcode-sim"
 path = "src/bin/shellcode_sim.rs"
 
+# Multithreaded counterparts: `benign-threads` is a false-positive control
+# across several worker threads; `mt-shellcode-sim` fires its payload from a
+# worker thread and is only caught when Wraith follows clones.
+[[bin]]
+name = "benign-threads"
+path = "src/bin/benign_threads.rs"
+
+[[bin]]
+name = "mt-shellcode-sim"
+path = "src/bin/mt_shellcode_sim.rs"
+
 [dependencies]
 nix = { version = "0.29", features = ["ptrace", "process", "signal"] }
 libc = "0.2"

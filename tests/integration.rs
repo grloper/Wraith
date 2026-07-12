@@ -12,15 +12,27 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use wraith::detect::Config;
 use wraith::event::{Event, Kind, Severity};
 use wraith::tracer::{Summary, Tracer};
 
+/// The tracer reaps its whole process tree with `waitpid(-1)`, which is exactly
+/// right for the real sensor (a dedicated process with a single tracer) but
+/// means two engines cannot run concurrently inside one process. `cargo test`
+/// runs these cases in parallel threads of one binary, so we serialize them
+/// through this lock; each trace runs start-to-finish before the next begins.
+fn trace_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Trace `bin` to completion, returning the collected events and the summary.
 /// Returns `None` if the tracer could not even start (no ptrace permission).
 fn trace(bin: &str, cfg: Config) -> Option<(Vec<Event>, Summary)> {
+    let _guard = trace_lock().lock().unwrap_or_else(|e| e.into_inner());
+
     let collected = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&collected);
 
@@ -100,6 +112,60 @@ fn shellcode_simulator_is_detected() {
     assert!(
         events.iter().any(|e| e.kind == Kind::ExploitationChain),
         "expected an exploitation-chain verdict"
+    );
+
+    assert_eq!(summary.max_severity, Some(Severity::Critical));
+}
+
+#[test]
+fn benign_threads_produce_no_detections() {
+    // Several worker threads doing ordinary work must stay clean: following a
+    // clone is not, by itself, a reason to fire. This is the false-positive
+    // control for thread-following.
+    let bin = env!("CARGO_BIN_EXE_benign-threads");
+    let Some((events, summary)) = trace(bin, Config::default()) else {
+        return; // ptrace unavailable — skip
+    };
+
+    assert!(summary.syscalls_seen > 0, "expected to observe some syscalls");
+    assert!(
+        events.is_empty(),
+        "benign multithreaded program should produce no events, got: {:?}",
+        events.iter().map(|e| e.to_line(false)).collect::<Vec<_>>()
+    );
+    assert!(summary.max_severity.is_none());
+    assert_eq!(summary.exit_code, Some(0));
+}
+
+#[test]
+fn worker_thread_exploit_is_detected() {
+    // The payload here stages RWX and issues its syscall from a *worker thread*
+    // born of a clone. A tracer that only watched the main thread would report
+    // this process clean; catching it proves thread-following works end-to-end.
+    let bin = env!("CARGO_BIN_EXE_mt-shellcode-sim");
+    let Some((events, summary)) = trace(bin, Config::default()) else {
+        return;
+    };
+
+    assert!(
+        events.iter().any(|e| e.kind == Kind::WxViolation),
+        "expected a W^X violation from the worker-thread RWX mmap"
+    );
+
+    let foreign_critical = events.iter().any(|e| {
+        e.kind == Kind::ForeignOriginSyscall && e.severity == Severity::Critical
+    });
+    assert!(
+        foreign_critical,
+        "expected a CRITICAL foreign-origin syscall from the worker thread, got: {:?}",
+        events.iter().map(|e| e.to_line(false)).collect::<Vec<_>>()
+    );
+
+    // Staging and firing happen on the worker but share the process address
+    // space, so the per-process correlator must still tie them into one chain.
+    assert!(
+        events.iter().any(|e| e.kind == Kind::ExploitationChain),
+        "expected an exploitation-chain verdict correlated across the thread"
     );
 
     assert_eq!(summary.max_severity, Some(Severity::Critical));

@@ -129,16 +129,26 @@ carry the smallest supply chain you can manage. The engine links only `nix` and
    ├─ syscalls.rs    the syscall table Wraith cares about
    ├─ detect.rs      the invariants + the exploitation-chain correlator
    ├─ event.rs       detection events + their JSONL form
-   ├─ tracer.rs      the ptrace engine (spawn/attach, syscall loop)
+   ├─ tracer.rs      the ptrace engine (spawn/attach, thread-following loop)
    └─ bin/
-       ├─ wraith.rs        the CLI sensor
-       ├─ benign.rs        false-positive control target
-       └─ shellcode_sim.rs exploitation-behaviour simulator
+       ├─ wraith.rs           the CLI sensor
+       ├─ benign.rs           false-positive control target
+       ├─ benign_threads.rs   multithreaded false-positive control
+       ├─ shellcode_sim.rs    exploitation-behaviour simulator
+       └─ mt_shellcode_sim.rs exploitation from a worker thread
 ```
 
 The tracer adds no syscall of its own on the hot path beyond the unavoidable
 `getregs`, and re-reads `/proc/<pid>/maps` only when a memory operation could
 have changed it.
+
+**Thread-following.** Real targets — network daemons, request handlers, fuzz
+harnesses — are multithreaded, and an exploit can fire from any thread. Wraith
+follows every `clone`/`fork`/`vfork` the target makes and inspects syscalls
+from *all* of them. Threads that share an address space share one cached memory
+map and one exploitation-chain accumulator, so a payload staged on one thread
+and fired from another is still correlated into a single verdict — while
+separate processes keep separate state.
 
 ---
 
@@ -152,9 +162,12 @@ claim to be a finished EDR.
   production path is the same logic on **eBPF** (`tracepoint/raw_syscalls` +
   a page-provenance map) for near-zero overhead — the detection model is
   transport-agnostic by design.
-- **Multithreading.** The current engine focuses on single-threaded targets;
-  full `PTRACE_O_TRACECLONE` thread-following and per-thread stack tracking is
-  the next milestone.
+- **Attach vs. pre-existing threads.** `wraith run` and `wraith attach` follow
+  every thread and child the target spawns *after* tracing begins (via
+  `PTRACE_O_TRACECLONE`/`FORK`/`VFORK`). When attaching to an already-running
+  multithreaded process, only the threads that clone after attach are picked
+  up automatically; seizing every pre-existing sibling thread is a small
+  follow-up.
 - **Pure-ROP that never leaves legit code.** An attacker who only reuses
   existing `.text` and never stages new executable memory won't trip the
   provenance rule — that's what the stack-pivot heuristic is for, and why
@@ -162,9 +175,10 @@ claim to be a finished EDR.
 - **Legitimate JIT** (browsers, JVMs, .NET) runs code from anonymous
   executable pages; hence `AnonExec` is WARN by default and configurable.
 
-Roadmap: eBPF backend · thread-following · return-address/shadow-stack checks ·
-ROP-chain length heuristics · per-process behavioural baselining · a policy DSL
-for allow-listing legitimate JIT regions.
+Roadmap: eBPF backend · return-address/shadow-stack checks · ROP-chain length
+heuristics · per-thread stack tracking · seizing pre-existing threads on attach
+· per-process behavioural baselining · a policy DSL for allow-listing
+legitimate JIT regions.
 
 ---
 
@@ -172,13 +186,15 @@ for allow-listing legitimate JIT regions.
 
 ```bash
 cargo build --release
-cargo test          # 28 unit + 4 end-to-end tests
+cargo test          # 28 unit + 6 end-to-end tests
 cargo clippy --all-targets
 ./demo.sh           # side-by-side benign vs. exploitation run
 ```
 
-The end-to-end tests drive the real ptrace engine over the `benign` and
-`shellcode-sim` binaries; they self-skip where `ptrace` is unavailable.
+The end-to-end tests drive the real ptrace engine over the `benign`,
+`benign-threads`, `shellcode-sim`, and `mt-shellcode-sim` binaries — including
+an exploit fired from a worker thread to exercise thread-following. They
+self-skip where `ptrace` is unavailable.
 
 ## License
 

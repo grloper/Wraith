@@ -6,6 +6,8 @@
 //! syscall, a stack pivot) are suspicious on their own, but seen together in
 //! one process they are an exploitation chain, and Wraith says so explicitly.
 
+use std::collections::HashMap;
+
 use crate::event::{Event, Kind, Severity};
 use crate::maps::MemoryMap;
 use crate::provenance::{classify_rip, classify_rsp, Origin, Prot, StackState};
@@ -64,21 +66,32 @@ impl ChainState {
 
 pub struct Detector {
     cfg: Config,
-    chain: ChainState,
+    /// One accumulating chain per traced address space (keyed by thread-group
+    /// id). Threads of a process share memory, so an exploit staged in one
+    /// thread and fired from another is a single chain; separate processes get
+    /// separate chains so their evidence never bleeds together.
+    chains: HashMap<i32, ChainState>,
 }
 
 impl Detector {
     pub fn new(cfg: Config) -> Self {
         Detector {
             cfg,
-            chain: ChainState::default(),
+            chains: HashMap::new(),
         }
     }
 
-    /// Inspect one syscall and return any events it triggers.
-    pub fn on_syscall(&mut self, ctx: &SyscallCtx, map: &MemoryMap) -> Vec<Event> {
+    /// Inspect one syscall and return any events it triggers. `proc_key`
+    /// identifies the address space the syscall belongs to (the tracee's
+    /// thread-group id); all threads sharing memory pass the same key so their
+    /// evidence correlates into one exploitation chain.
+    pub fn on_syscall(&mut self, proc_key: i32, ctx: &SyscallCtx, map: &MemoryMap) -> Vec<Event> {
         let mut events = Vec::new();
         let sysname = syscalls::name(ctx.nr);
+        // Disjoint field borrows: `cfg` is read-only, `chain` is the mutable
+        // per-process accumulator for this address space.
+        let cfg = &self.cfg;
+        let chain = self.chains.entry(proc_key).or_default();
 
         // Breadcrumb: first-stage payloads usually arrive over a read/recv.
         // A bare `read` is only interesting when it comes from stdin (fd 0);
@@ -90,16 +103,16 @@ impl Detector {
                 _ => true,                  // recvfrom/recvmsg
             };
             if is_external_input {
-                self.chain.net_input = true;
+                chain.net_input = true;
             }
         }
 
         // 1. Provenance of the syscall instruction itself.
         let origin = classify_rip(map, ctx.rip);
         if origin.is_anomalous() {
-            self.chain.foreign_origin = true;
+            chain.foreign_origin = true;
             let sensitive = syscalls::is_sensitive(ctx.nr);
-            let severity = self.foreign_severity(origin, sensitive);
+            let severity = foreign_severity(cfg, origin, sensitive);
             let label = map.region_at(ctx.rip).map(|r| r.label()).unwrap_or_else(|| "unmapped".into());
             let detail = if sensitive {
                 format!(
@@ -119,7 +132,7 @@ impl Detector {
                 label,
                 detail,
             ));
-        } else if self.cfg.audit_sensitive && syscalls::is_sensitive(ctx.nr) {
+        } else if cfg.audit_sensitive && syscalls::is_sensitive(ctx.nr) {
             let label = map.region_at(ctx.rip).map(|r| r.label()).unwrap_or_else(|| "?".into());
             events.push(Event::now(
                 ctx.pid,
@@ -134,10 +147,10 @@ impl Detector {
         }
 
         // 2. Stack pivot: the stack pointer is somewhere no real stack lives.
-        if self.cfg.detect_stack_pivot {
+        if cfg.detect_stack_pivot {
             let ss = classify_rsp(map, ctx.rsp);
             if ss.is_anomalous() && ss != StackState::Unmapped {
-                self.chain.stack_pivot = true;
+                chain.stack_pivot = true;
                 let label = map.region_at(ctx.rsp).map(|r| r.label()).unwrap_or_else(|| "?".into());
                 events.push(Event::now(
                     ctx.pid,
@@ -158,7 +171,7 @@ impl Detector {
             let prot = Prot::from_raw(ctx.args[2]);
             let addr = ctx.args[0];
             if prot.is_wx() {
-                self.chain.wx_staged = true;
+                chain.wx_staged = true;
                 events.push(Event::now(
                     ctx.pid,
                     Severity::High,
@@ -174,7 +187,7 @@ impl Detector {
                 // W->X flip an attacker performs after writing a payload.
                 if let Some(region) = map.region_at(addr) {
                     if region.write {
-                        self.chain.wx_staged = true;
+                        chain.wx_staged = true;
                         events.push(Event::now(
                             ctx.pid,
                             Severity::High,
@@ -193,13 +206,14 @@ impl Detector {
         // 4. Correlate. A sensitive syscall from foreign code, combined with
         //    any prior staging milestone, is an exploitation chain — one high
         //    confidence verdict rather than a scatter of primitives.
-        if !self.chain.chain_reported
-            && self.chain.foreign_origin
+        if !chain.chain_reported
+            && chain.foreign_origin
             && syscalls::is_sensitive(ctx.nr)
             && origin.is_anomalous()
-            && self.chain.staging_count() >= 1
+            && chain.staging_count() >= 1
         {
-            self.chain.chain_reported = true;
+            chain.chain_reported = true;
+            let narrative = chain_narrative(chain);
             events.push(Event::now(
                 ctx.pid,
                 Severity::Critical,
@@ -208,43 +222,43 @@ impl Detector {
                 ctx.rip,
                 ctx.rsp,
                 "correlated",
-                self.chain_narrative(),
+                narrative,
             ));
         }
 
         events
     }
+}
 
-    fn foreign_severity(&self, origin: Origin, sensitive: bool) -> Severity {
-        if sensitive {
-            return Severity::Critical;
-        }
-        match origin {
-            Origin::AnonExec => {
-                if self.cfg.jit_is_critical {
-                    Severity::High
-                } else {
-                    Severity::Warn
-                }
+fn foreign_severity(cfg: &Config, origin: Origin, sensitive: bool) -> Severity {
+    if sensitive {
+        return Severity::Critical;
+    }
+    match origin {
+        Origin::AnonExec => {
+            if cfg.jit_is_critical {
+                Severity::High
+            } else {
+                Severity::Warn
             }
-            _ => Severity::High,
         }
+        _ => Severity::High,
     }
+}
 
-    fn chain_narrative(&self) -> String {
-        let mut steps = Vec::new();
-        if self.chain.net_input {
-            steps.push("attacker-controlled input received");
-        }
-        if self.chain.wx_staged {
-            steps.push("executable payload staged (W^X)");
-        }
-        if self.chain.stack_pivot {
-            steps.push("stack pivot");
-        }
-        steps.push("sensitive syscall from injected code");
-        format!("EXPLOITATION CHAIN: {}", steps.join(" -> "))
+fn chain_narrative(chain: &ChainState) -> String {
+    let mut steps = Vec::new();
+    if chain.net_input {
+        steps.push("attacker-controlled input received");
     }
+    if chain.wx_staged {
+        steps.push("executable payload staged (W^X)");
+    }
+    if chain.stack_pivot {
+        steps.push("stack pivot");
+    }
+    steps.push("sensitive syscall from injected code");
+    format!("EXPLOITATION CHAIN: {}", steps.join(" -> "))
 }
 
 #[cfg(test)]
@@ -272,14 +286,14 @@ mod tests {
     #[test]
     fn legit_syscall_from_libc_is_silent() {
         let mut d = Detector::new(Config::default());
-        let ev = d.on_syscall(&ctx(1, 0x7f0000000500, 0x7ffd00010000, [0; 6]), &map());
+        let ev = d.on_syscall(1, &ctx(1, 0x7f0000000500, 0x7ffd00010000, [0; 6]), &map());
         assert!(ev.is_empty());
     }
 
     #[test]
     fn syscall_from_rwx_page_is_flagged() {
         let mut d = Detector::new(Config::default());
-        let ev = d.on_syscall(&ctx(1, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        let ev = d.on_syscall(1, &ctx(1, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, Kind::ForeignOriginSyscall);
         assert_eq!(ev[0].severity, Severity::High);
@@ -289,7 +303,7 @@ mod tests {
     fn execve_from_injected_code_is_critical() {
         let mut d = Detector::new(Config::default());
         // execve (59) from the RWX page.
-        let ev = d.on_syscall(&ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(ev.iter().any(|e| e.severity == Severity::Critical
             && e.kind == Kind::ForeignOriginSyscall));
     }
@@ -299,7 +313,7 @@ mod tests {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
         // Called from legit code, so the only event is the W^X violation.
-        let ev = d.on_syscall(&ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        let ev = d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, Kind::WxViolation);
     }
@@ -308,14 +322,14 @@ mod tests {
     fn mprotect_wx_transition_on_writable_page() {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_EXEC) as u64; // exec only, but page is writable
-        let ev = d.on_syscall(&ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        let ev = d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
         assert!(ev.iter().any(|e| e.kind == Kind::WxTransition));
     }
 
     #[test]
     fn stack_pivot_into_heap_detected() {
         let mut d = Detector::new(Config::default());
-        let ev = d.on_syscall(&ctx(1, 0x7f0000000500, 0x55f000004000, [0; 6]), &map());
+        let ev = d.on_syscall(1, &ctx(1, 0x7f0000000500, 0x55f000004000, [0; 6]), &map());
         assert!(ev.iter().any(|e| e.kind == Kind::StackPivot));
     }
 
@@ -324,9 +338,9 @@ mod tests {
         let mut d = Detector::new(Config::default());
         // Step 1: stage RWX via mprotect (from legit code).
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(&ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
         // Step 2: execve from the injected RWX page.
-        let ev = d.on_syscall(&ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(ev.iter().any(|e| e.kind == Kind::ExploitationChain
             && e.severity == Severity::Critical));
     }
@@ -335,9 +349,9 @@ mod tests {
     fn chain_reported_only_once() {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(&ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
-        let first = d.on_syscall(&ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
-        let second = d.on_syscall(&ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        let first = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        let second = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(first.iter().any(|e| e.kind == Kind::ExploitationChain));
         assert!(!second.iter().any(|e| e.kind == Kind::ExploitationChain));
     }
