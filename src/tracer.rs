@@ -6,8 +6,21 @@
 //! the snapshot to the [`Detector`]. The design goal is to add no syscall of
 //! our own on the hot path beyond the unavoidable `getregs`, and to re-read
 //! `/proc/<pid>/maps` only when it can have changed.
+//!
+//! ## Thread-following
+//!
+//! Real targets — network daemons, parsers, fuzz harnesses — spawn threads, so
+//! an exploit can fire from any of them. The engine follows every `clone`,
+//! `fork`, and `vfork` (via `PTRACE_O_TRACE{CLONE,FORK,VFORK}`) and reaps *all*
+//! tracees with `waitpid(-1)`. Each thread keeps its own syscall entry/exit
+//! phase, while threads that share an address space (same thread-group id)
+//! share one cached memory map and one exploitation-chain accumulator — so a
+//! payload staged in one thread and fired from another is still one verdict.
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::fs;
 use std::io;
 
 use nix::sys::ptrace;
@@ -19,6 +32,28 @@ use crate::detect::{Config, Detector, SyscallCtx};
 use crate::event::{Event, Kind, Severity};
 use crate::maps::MemoryMap;
 use crate::syscalls;
+
+/// A cached memory map for one address space (one thread-group), plus a flag
+/// set whenever any thread in the group runs a memory-management syscall that
+/// could have changed it. Threads share memory, so one thread's `mmap`
+/// invalidates the whole group's view.
+struct AddrSpace {
+    map: Option<MemoryMap>,
+    dirty: bool,
+}
+
+impl AddrSpace {
+    fn new() -> Self {
+        AddrSpace { map: None, dirty: true }
+    }
+}
+
+/// Per-thread bookkeeping. `PTRACE_SYSCALL` stops at both entry and exit; each
+/// thread toggles its own phase independently since their stops interleave.
+struct ThreadState {
+    at_entry: bool,
+    tgid: i32,
+}
 
 /// Outcome of a completed trace.
 #[derive(Debug, Default, Clone)]
@@ -129,58 +164,101 @@ impl Tracer {
         }
     }
 
-    /// Run the trace to completion (or until the attached process detaches),
-    /// invoking `on_event` for every detection.
+    /// Run the trace to completion — following every thread and child the
+    /// target spawns — invoking `on_event` for every detection. The trace ends
+    /// once the last tracee has exited.
     pub fn run<F>(mut self, mut on_event: F) -> io::Result<Summary>
     where
         F: FnMut(&Event),
     {
-        let pid = self.pid();
+        let root = self.pid();
         let mut summary = Summary::default();
 
-        // Cached map plus a "may be stale" flag set after memory operations.
-        let mut map: Option<MemoryMap> = None;
-        let mut map_dirty = true;
-        // PTRACE_SYSCALL stops at both entry and exit; we only inspect entries.
-        let mut at_entry = true;
+        // Per-thread phase, and per-address-space (tgid) cached maps. Threads
+        // that share memory share an `AddrSpace` entry.
+        let mut threads: HashMap<i32, ThreadState> = HashMap::new();
+        let mut spaces: HashMap<i32, AddrSpace> = HashMap::new();
 
-        // Kick the tracee toward its first syscall stop.
-        ptrace::syscall(pid, None).map_err(nix_err)?;
+        let root_tgid = read_tgid(root.as_raw());
+        threads.insert(root.as_raw(), ThreadState { at_entry: true, tgid: root_tgid });
+        spaces.insert(root_tgid, AddrSpace::new());
+
+        // Kick the root tracee toward its first syscall stop.
+        ptrace::syscall(root, None).map_err(nix_err)?;
 
         loop {
-            let status = waitpid(pid, None).map_err(nix_err)?;
+            // Reap any tracee. `ECHILD` means every thread and child has gone.
+            let status = match waitpid(Pid::from_raw(-1), None) {
+                Ok(s) => s,
+                Err(nix::errno::Errno::ECHILD) => break,
+                Err(e) => return Err(nix_err(e)),
+            };
+
+            let Some(who) = status_pid(&status) else { continue };
+            let raw = who.as_raw();
+
+            // First sighting of a tid: a freshly-cloned thread or child, still
+            // stopped at its creation stop with our trace options inherited.
+            // Registering lazily on first sight (rather than parsing the parent
+            // clone event) sidesteps the parent/child wait-ordering race.
+            if let Entry::Vacant(slot) = threads.entry(raw) {
+                let tgid = read_tgid(raw);
+                slot.insert(ThreadState { at_entry: true, tgid });
+                spaces.entry(tgid).or_insert_with(AddrSpace::new);
+                // Consume this initial stop and let the new tracee run; the
+                // creation SIGSTOP must not be forwarded.
+                let _ = ptrace::syscall(who, None);
+                continue;
+            }
+
             match status {
                 WaitStatus::Exited(_, code) => {
-                    summary.exit_code = Some(code);
-                    break;
+                    threads.remove(&raw);
+                    if raw == root.as_raw() {
+                        summary.exit_code = Some(code);
+                    }
+                    if threads.is_empty() {
+                        break;
+                    }
                 }
                 WaitStatus::Signaled(_, sig, _) => {
-                    summary.term_signal = Some(sig as i32);
-                    break;
+                    threads.remove(&raw);
+                    if raw == root.as_raw() {
+                        summary.term_signal = Some(sig as i32);
+                    }
+                    if threads.is_empty() {
+                        break;
+                    }
                 }
                 WaitStatus::PtraceSyscall(_) => {
-                    if at_entry {
+                    let tgid = threads[&raw].tgid;
+                    if threads[&raw].at_entry {
                         summary.syscalls_seen += 1;
-                        if let Some(nr) = self.inspect(pid, &mut map, &mut map_dirty, &mut summary, &mut on_event) {
-                            // The memory map may change as a result of this
-                            // call; force a refresh before the next inspection.
+                        let space = spaces.entry(tgid).or_insert_with(AddrSpace::new);
+                        let nr = self.inspect(who, tgid, space, &mut summary, &mut on_event);
+                        if let Some(nr) = nr {
+                            // A memory op by any thread can change the shared
+                            // address space; invalidate the whole group's map.
                             if syscalls::is_memory_op(nr) {
-                                map_dirty = true;
+                                spaces.get_mut(&tgid).unwrap().dirty = true;
                             }
                         }
                     }
-                    at_entry = !at_entry;
-                    ptrace::syscall(pid, None).map_err(nix_err)?;
+                    let ts = threads.get_mut(&raw).unwrap();
+                    ts.at_entry = !ts.at_entry;
+                    ptrace::syscall(who, None).map_err(nix_err)?;
                 }
                 WaitStatus::Stopped(_, sig) => {
                     // A real signal was delivered to the tracee (not a syscall
                     // stop). Fatal memory-safety signals are worth surfacing as
                     // a possible failed exploit, then we forward the signal.
-                    self.on_signal(pid, sig, &mut summary, &mut on_event);
-                    ptrace::syscall(pid, Some(sig)).map_err(nix_err)?;
+                    self.on_signal(who, sig, &mut summary, &mut on_event);
+                    ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
                 }
                 WaitStatus::PtraceEvent(_, _, _) => {
-                    ptrace::syscall(pid, None).map_err(nix_err)?;
+                    // Clone/fork/exec notification for a tracee we already know;
+                    // the new child is handled on its own first sighting above.
+                    ptrace::syscall(who, None).map_err(nix_err)?;
                 }
                 WaitStatus::Continued(_) => {}
                 WaitStatus::StillAlive => {}
@@ -189,42 +267,44 @@ impl Tracer {
         Ok(summary)
     }
 
-    /// Inspect a single syscall-entry stop. Returns the syscall number, or
-    /// `None` if registers could not be read.
+    /// Inspect a single syscall-entry stop for thread `who` in address space
+    /// `space`. Returns the syscall number, or `None` if registers could not
+    /// be read.
     fn inspect<F>(
         &mut self,
-        pid: Pid,
-        map: &mut Option<MemoryMap>,
-        map_dirty: &mut bool,
+        who: Pid,
+        tgid: i32,
+        space: &mut AddrSpace,
         summary: &mut Summary,
         on_event: &mut F,
     ) -> Option<u64>
     where
         F: FnMut(&Event),
     {
-        let regs = ptrace::getregs(pid).ok()?;
+        let regs = ptrace::getregs(who).ok()?;
         let nr = regs.orig_rax;
 
-        // Refresh the memory map if stale or unset.
-        if *map_dirty || map.is_none() {
-            if let Ok(fresh) = MemoryMap::read(pid.as_raw()) {
-                *map = Some(fresh);
-                *map_dirty = false;
+        // Refresh the shared map if stale or unset. Reading `/proc/<tid>/maps`
+        // for any thread yields the whole group's address space.
+        if space.dirty || space.map.is_none() {
+            if let Ok(fresh) = MemoryMap::read(who.as_raw()) {
+                space.map = Some(fresh);
+                space.dirty = false;
             }
         }
-        let current = map.as_ref()?;
+        let current = space.map.as_ref()?;
 
         // The `syscall` instruction is two bytes; RIP already points past it.
         let site = regs.rip.wrapping_sub(2);
         let ctx = SyscallCtx {
-            pid: pid.as_raw(),
+            pid: who.as_raw(),
             nr,
             rip: site,
             rsp: regs.rsp,
             args: [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9],
         };
 
-        for ev in self.detector.on_syscall(&ctx, current) {
+        for ev in self.detector.on_syscall(tgid, &ctx, current) {
             summary.record(&ev);
             on_event(&ev);
         }
@@ -267,8 +347,47 @@ fn set_options(pid: Pid) -> io::Result<()> {
     // TRACESYSGOOD lets us tell syscall stops apart from signal stops.
     // EXITKILL guarantees the tracee dies with us instead of being left
     // orphaned and stopped if the tracer crashes.
-    ptrace::setoptions(pid, Options::PTRACE_O_TRACESYSGOOD | Options::PTRACE_O_EXITKILL)
-        .map_err(nix_err)
+    // TRACE{CLONE,FORK,VFORK} make every thread and child the target spawns a
+    // tracee too, and are inherited by those descendants — so following the
+    // whole process tree needs setting them only on the root.
+    ptrace::setoptions(
+        pid,
+        Options::PTRACE_O_TRACESYSGOOD
+            | Options::PTRACE_O_EXITKILL
+            | Options::PTRACE_O_TRACECLONE
+            | Options::PTRACE_O_TRACEFORK
+            | Options::PTRACE_O_TRACEVFORK,
+    )
+    .map_err(nix_err)
+}
+
+/// The pid a [`WaitStatus`] refers to, if it carries one.
+fn status_pid(status: &WaitStatus) -> Option<Pid> {
+    match status {
+        WaitStatus::Exited(p, _)
+        | WaitStatus::Signaled(p, _, _)
+        | WaitStatus::Stopped(p, _)
+        | WaitStatus::PtraceEvent(p, _, _)
+        | WaitStatus::PtraceSyscall(p)
+        | WaitStatus::Continued(p) => Some(*p),
+        WaitStatus::StillAlive => None,
+    }
+}
+
+/// The thread-group id of a thread, read once from `/proc/<tid>/status`.
+/// Threads of a process share a tgid (and their address space); a `fork`ed
+/// child gets its own. Falls back to the tid itself if status is unreadable.
+fn read_tgid(tid: i32) -> i32 {
+    if let Ok(status) = fs::read_to_string(format!("/proc/{tid}/status")) {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Tgid:") {
+                if let Ok(v) = rest.trim().parse::<i32>() {
+                    return v;
+                }
+            }
+        }
+    }
+    tid
 }
 
 fn nix_err(e: nix::errno::Errno) -> io::Error {
