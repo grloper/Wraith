@@ -54,10 +54,26 @@ echo "   -> wraith exit code: $mt_code"
 set -e
 
 echo
+echo "============================================================"
+echo " 5/5  ENFORCEMENT — same payload, but Wraith intervenes"
+echo "============================================================"
+echo "--- --block: the injected socket() is neutralised (returns -ENOSYS),"
+echo "    the process survives so you can watch what it does next ---"
+set +e
+"$WRAITH" run --block -- "$SIM"
+echo "   -> wraith exit code: $?"
+echo
+echo "--- --kill: the traced tree is SIGKILLed before the payload runs ---"
+"$WRAITH" run --kill -- "$SIM"
+echo "   -> wraith exit code: $?"
+set -e
+
+echo
 if [ "$code" -eq 3 ] && [ "$mt_code" -eq 3 ]; then
   echo "Demo OK: benign runs (single- and multi-threaded) were clean;"
   echo "         injected-code execution was detected on the main thread AND"
-  echo "         on a worker thread, and correlated into an exploitation chain."
+  echo "         on a worker thread, correlated into an exploitation chain, and"
+  echo "         (in --block/--kill) stopped before the payload's syscall ran."
 else
   echo "Demo WARNING: expected exit 3 from both simulator runs (got $code and $mt_code)."
 fi

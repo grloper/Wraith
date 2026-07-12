@@ -24,11 +24,11 @@ use std::fs;
 use std::io;
 
 use nix::sys::ptrace;
-use nix::sys::signal::Signal;
+use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{execvp, fork, ForkResult, Pid};
 
-use crate::detect::{Config, Detector, SyscallCtx};
+use crate::detect::{Config, Detector, Enforcement, SyscallCtx};
 use crate::event::{Event, Kind, Severity};
 use crate::maps::MemoryMap;
 use crate::syscalls;
@@ -53,6 +53,15 @@ impl AddrSpace {
 struct ThreadState {
     at_entry: bool,
     tgid: i32,
+}
+
+/// What one syscall-entry inspection produced, so the run loop can decide
+/// whether to enforce.
+struct Inspection {
+    /// The syscall number, or `None` if registers could not be read.
+    nr: Option<u64>,
+    /// The highest severity among the events this syscall raised, if any.
+    max_severity: Option<Severity>,
 }
 
 /// Outcome of a completed trace.
@@ -86,6 +95,10 @@ enum Target {
 pub struct Tracer {
     target: Target,
     detector: Detector,
+    /// What to do on confirmed exploitation. Kept on the tracer (not just the
+    /// detector) because acting on the tracee — cancelling a syscall, killing
+    /// the tree — is a ptrace operation the engine owns.
+    enforcement: Enforcement,
 }
 
 impl Tracer {
@@ -129,9 +142,11 @@ impl Tracer {
                     }
                 }
                 set_options(child)?;
+                let enforcement = cfg.enforcement;
                 Ok(Tracer {
                     target: Target::Spawned(child),
                     detector: Detector::new(cfg),
+                    enforcement,
                 })
             }
         }
@@ -151,9 +166,11 @@ impl Tracer {
             }
         }
         set_options(child)?;
+        let enforcement = cfg.enforcement;
         Ok(Tracer {
             target: Target::Attached(child),
             detector: Detector::new(cfg),
+            enforcement,
         })
     }
 
@@ -232,21 +249,47 @@ impl Tracer {
                 }
                 WaitStatus::PtraceSyscall(_) => {
                     let tgid = threads[&raw].tgid;
+                    let mut killed = false;
                     if threads[&raw].at_entry {
                         summary.syscalls_seen += 1;
                         let space = spaces.entry(tgid).or_insert_with(AddrSpace::new);
-                        let nr = self.inspect(who, tgid, space, &mut summary, &mut on_event);
-                        if let Some(nr) = nr {
+                        let step = self.inspect(who, tgid, space, &mut summary, &mut on_event);
+                        if let Some(nr) = step.nr {
                             // A memory op by any thread can change the shared
                             // address space; invalidate the whole group's map.
                             if syscalls::is_memory_op(nr) {
                                 spaces.get_mut(&tgid).unwrap().dirty = true;
                             }
                         }
+                        // Enforce only on a confirmed exploitation (CRITICAL),
+                        // and only at the syscall's entry stop — the one moment
+                        // the offending syscall has not yet run.
+                        if self.enforcement != Enforcement::Observe
+                            && step.max_severity == Some(Severity::Critical)
+                        {
+                            match self.enforcement {
+                                Enforcement::Block => {
+                                    self.block_syscall(who, &mut summary, &mut on_event)
+                                }
+                                Enforcement::Kill => {
+                                    self.kill_tree(who, &threads, &mut summary, &mut on_event);
+                                    killed = true;
+                                }
+                                Enforcement::Observe => {}
+                            }
+                        }
                     }
                     let ts = threads.get_mut(&raw).unwrap();
                     ts.at_entry = !ts.at_entry;
-                    ptrace::syscall(who, None).map_err(nix_err)?;
+                    // Resume. After a kill the tracee is stopped with a pending
+                    // SIGKILL; restarting it lets the kernel deliver it, and the
+                    // call racing with the process's death is expected, so a
+                    // failure here is not fatal to the trace.
+                    if killed {
+                        let _ = ptrace::syscall(who, None);
+                    } else {
+                        ptrace::syscall(who, None).map_err(nix_err)?;
+                    }
                 }
                 WaitStatus::Stopped(_, sig) => {
                     // A real signal was delivered to the tracee (not a syscall
@@ -268,8 +311,8 @@ impl Tracer {
     }
 
     /// Inspect a single syscall-entry stop for thread `who` in address space
-    /// `space`. Returns the syscall number, or `None` if registers could not
-    /// be read.
+    /// `space`, reporting the syscall number and the highest severity it
+    /// raised so the caller can decide whether to enforce.
     fn inspect<F>(
         &mut self,
         who: Pid,
@@ -277,11 +320,13 @@ impl Tracer {
         space: &mut AddrSpace,
         summary: &mut Summary,
         on_event: &mut F,
-    ) -> Option<u64>
+    ) -> Inspection
     where
         F: FnMut(&Event),
     {
-        let regs = ptrace::getregs(who).ok()?;
+        let Ok(regs) = ptrace::getregs(who) else {
+            return Inspection { nr: None, max_severity: None };
+        };
         let nr = regs.orig_rax;
 
         // Refresh the shared map if stale or unset. Reading `/proc/<tid>/maps`
@@ -292,7 +337,9 @@ impl Tracer {
                 space.dirty = false;
             }
         }
-        let current = space.map.as_ref()?;
+        let Some(current) = space.map.as_ref() else {
+            return Inspection { nr: Some(nr), max_severity: None };
+        };
 
         // The `syscall` instruction is two bytes; RIP already points past it.
         let site = regs.rip.wrapping_sub(2);
@@ -304,11 +351,85 @@ impl Tracer {
             args: [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9],
         };
 
+        let mut max_severity = None;
         for ev in self.detector.on_syscall(tgid, &ctx, current) {
+            max_severity = Some(max_severity.map_or(ev.severity, |cur: Severity| cur.max(ev.severity)));
             summary.record(&ev);
             on_event(&ev);
         }
-        Some(nr)
+        Inspection { nr: Some(nr), max_severity }
+    }
+
+    /// Neutralise the syscall the tracee is stopped at by overwriting its
+    /// syscall number with an invalid value: the kernel then skips the call and
+    /// returns `-ENOSYS`, so the injected code's action never takes effect. The
+    /// tracee lives on, which is what `--block` is for.
+    fn block_syscall<F>(&self, who: Pid, summary: &mut Summary, on_event: &mut F)
+    where
+        F: FnMut(&Event),
+    {
+        let Ok(mut regs) = ptrace::getregs(who) else { return };
+        let syscall = syscalls::name(regs.orig_rax);
+        let rip = regs.rip.wrapping_sub(2);
+        let rsp = regs.rsp;
+        // -1 is not a valid syscall number; the kernel rejects it without
+        // running anything and reports -ENOSYS to the tracee.
+        regs.orig_rax = u64::MAX;
+        if ptrace::setregs(who, regs).is_err() {
+            return;
+        }
+        let ev = Event::now(
+            who.as_raw(),
+            Severity::Critical,
+            Kind::Blocked,
+            syscall.clone(),
+            rip,
+            rsp,
+            "enforced",
+            format!("neutralised `{syscall}` from injected code before it executed (--block)"),
+        );
+        summary.record(&ev);
+        on_event(&ev);
+    }
+
+    /// `SIGKILL` every thread-group under trace. Sending the signal to a group
+    /// leader (a tgid) tears down all of its threads at once, so the offending
+    /// process — and every sibling we are following — dies before the syscall
+    /// we stopped at can run.
+    fn kill_tree<F>(
+        &self,
+        who: Pid,
+        threads: &HashMap<i32, ThreadState>,
+        summary: &mut Summary,
+        on_event: &mut F,
+    ) where
+        F: FnMut(&Event),
+    {
+        let (syscall, rip, rsp) = ptrace::getregs(who)
+            .map(|r| (syscalls::name(r.orig_rax), r.rip.wrapping_sub(2), r.rsp))
+            .unwrap_or_else(|_| ("?".to_string(), 0, 0));
+
+        // One SIGKILL per distinct thread-group is enough to take down all of
+        // its threads; de-duplicating avoids redundant signals.
+        let mut killed_groups = std::collections::HashSet::new();
+        for ts in threads.values() {
+            if killed_groups.insert(ts.tgid) {
+                let _ = kill(Pid::from_raw(ts.tgid), Signal::SIGKILL);
+            }
+        }
+
+        let ev = Event::now(
+            who.as_raw(),
+            Severity::Critical,
+            Kind::Killed,
+            syscall.clone(),
+            rip,
+            rsp,
+            "enforced",
+            format!("killed traced process tree on `{syscall}` from injected code (--kill)"),
+        );
+        summary.record(&ev);
+        on_event(&ev);
     }
 
     fn on_signal<F>(&self, pid: Pid, sig: Signal, summary: &mut Summary, on_event: &mut F)
