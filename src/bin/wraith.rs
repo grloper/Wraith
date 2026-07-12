@@ -3,6 +3,7 @@
 //! Usage:
 //!   wraith run [OPTIONS] -- <program> [args...]   spawn and monitor a program
 //!   wraith attach [OPTIONS] <pid>                  monitor a running process
+//!   wraith scan [OPTIONS] (--match <s> | --all)    monitor many running procs
 //!
 //! Options:
 //!   --json <FILE|->      also write JSONL events (`-` for stdout)
@@ -11,6 +12,8 @@
 //!   --trust-region A-B   treat the hex range [A,B) as legitimate JIT (repeatable)
 //!   --block              neutralise the offending syscall on detection
 //!   --kill               SIGKILL the traced tree on detection
+//!   --match <substr>     (scan) attach to processes whose name/cmdline matches
+//!   --all                (scan) attach to every process we're allowed to trace
 //!   --no-stack-pivot     disable the ROP stack-pivot heuristic
 //!   --audit-sensitive    also log sensitive syscalls from legitimate code
 //!   --quiet              suppress the human event stream (use with --json)
@@ -62,6 +65,8 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     let mut i = 0;
     let mut target: Vec<String> = Vec::new();
     let mut attach_pid: Option<i32> = None;
+    let mut scan_matches: Vec<String> = Vec::new();
+    let mut scan_all = false;
 
     while i < rest.len() {
         let a = &rest[i];
@@ -87,6 +92,12 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
             }
             "--block" => opts.cfg.enforcement = Enforcement::Block,
             "--kill" => opts.cfg.enforcement = Enforcement::Kill,
+            "--match" => {
+                i += 1;
+                let v = rest.get(i).ok_or_else(|| bad("--match needs a substring"))?;
+                scan_matches.push(v.clone());
+            }
+            "--all" => scan_all = true,
             "--no-stack-pivot" => opts.cfg.detect_stack_pivot = false,
             "--audit-sensitive" => opts.cfg.audit_sensitive = true,
             "--quiet" => opts.quiet = true,
@@ -144,7 +155,32 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
             eprintln!("wraith: attaching to pid {pid}{enforce_note}");
             Tracer::attach(pid, opts.cfg)?
         }
-        other => return Err(bad(&format!("unknown mode `{other}` (expected run|attach)"))),
+        "scan" => {
+            if !scan_all && scan_matches.is_empty() {
+                return Err(bad(
+                    "scan needs a filter: --match <substring> (repeatable) or --all",
+                ));
+            }
+            let pids = enumerate_scan_pids(&scan_matches, scan_all);
+            if pids.is_empty() {
+                return Err(bad("scan matched no running processes"));
+            }
+            eprintln!(
+                "wraith: scanning {} process(es){}{enforce_note}",
+                pids.len(),
+                if scan_all {
+                    " (--all)".to_string()
+                } else {
+                    format!(" matching {scan_matches:?}")
+                },
+            );
+            Tracer::attach_many(&pids, opts.cfg)?
+        }
+        other => {
+            return Err(bad(&format!(
+                "unknown mode `{other}` (expected run|attach|scan)"
+            )))
+        }
     };
 
     let summary = tracer.run(&mut on_event)?;
@@ -173,6 +209,48 @@ fn verdict(sev: Option<Severity>) -> &'static str {
         Some(Severity::Warn) => "minor anomalies",
         _ => "clean",
     }
+}
+
+/// Walk `/proc` and return the PIDs to scan. A process is selected when `all`
+/// is set, or when any `needle` is a substring of its `comm` or `cmdline`. The
+/// scanner's own PID and PID 1 are always excluded; the attach itself (in
+/// [`Tracer::attach_many`]) skips anything we lack permission to trace.
+fn enumerate_scan_pids(needles: &[String], all: bool) -> Vec<i32> {
+    let self_pid = std::process::id() as i32;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid == self_pid || pid == 1 {
+            continue;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        // cmdline is NUL-separated argv; join it into one searchable string.
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+            .unwrap_or_default();
+        if proc_matches(comm.trim(), cmdline.trim(), needles, all) {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Pure predicate: does a process with this `comm`/`cmdline` pass the filter?
+/// Split out from the `/proc` walk so it can be unit-tested without a live
+/// process table.
+fn proc_matches(comm: &str, cmdline: &str, needles: &[String], all: bool) -> bool {
+    if all {
+        return true;
+    }
+    needles
+        .iter()
+        .any(|n| comm.contains(n.as_str()) || cmdline.contains(n.as_str()))
 }
 
 /// Parse a `START-END` hex range (each side optionally `0x`-prefixed) into a
@@ -209,7 +287,8 @@ fn print_help() {
         "wraith — signature-free runtime exploitation detection\n\n\
 USAGE:\n  \
 wraith run [OPTIONS] -- <program> [args...]   spawn and monitor a program\n  \
-wraith attach [OPTIONS] <pid>                 monitor a running process\n\n\
+wraith attach [OPTIONS] <pid>                 monitor one running process\n  \
+wraith scan [OPTIONS] (--match <s> | --all)   monitor many running processes\n\n\
 OPTIONS:\n  \
 --json <FILE|->      also write JSONL events (`-` = stdout)\n  \
 --min <SEV>          minimum severity to report: info|warn|high|critical (default: warn)\n  \
@@ -217,6 +296,8 @@ OPTIONS:\n  \
 --trust-region A-B    treat the hex range [A,B) as legitimate JIT (repeatable)\n  \
 --block              neutralise the offending syscall on exploitation (CRITICAL)\n  \
 --kill               SIGKILL the traced tree on exploitation (CRITICAL)\n  \
+--match <substr>     (scan) attach to processes whose name/cmdline matches (repeatable)\n  \
+--all                (scan) attach to every process we're allowed to trace\n  \
 --no-stack-pivot     disable the ROP stack-pivot heuristic\n  \
 --audit-sensitive    also log sensitive syscalls from legitimate code\n  \
 --quiet              suppress the human stream (pair with --json)\n  \
@@ -225,7 +306,56 @@ ENFORCEMENT:\n  \
 Detection is always on. --block and --kill add active response and fire only on\n  \
 a CRITICAL verdict (injected code issuing a sensitive syscall, or a correlated\n  \
 chain): --block cancels that syscall in place; --kill terminates the tree.\n\n\
+SCAN:\n  \
+`scan` attaches to a set of already-running processes at once. It needs\n  \
+CAP_SYS_PTRACE (or ownership of the targets) and adds two stops per syscall to\n  \
+each, so favour --match over --all on a busy host. Stopping wraith leaves the\n  \
+scanned processes running.\n\n\
 EXIT CODES:\n  \
 0 clean/minor · 1 suspicious (HIGH) · 3 exploitation (CRITICAL) · 2 usage error\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn needles(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn all_matches_everything() {
+        assert!(proc_matches("anything", "", &[], true));
+        assert!(proc_matches("", "", &needles(&["nomatch"]), true));
+    }
+
+    #[test]
+    fn match_by_comm_or_cmdline() {
+        let n = needles(&["nginx"]);
+        assert!(proc_matches("nginx", "/usr/sbin/nginx -g daemon off;", &n, false));
+        assert!(proc_matches("worker", "/usr/sbin/nginx: worker process", &n, false));
+        assert!(!proc_matches("sshd", "/usr/sbin/sshd -D", &n, false));
+    }
+
+    #[test]
+    fn empty_filter_matches_nothing() {
+        assert!(!proc_matches("anything", "any cmdline", &[], false));
+    }
+
+    #[test]
+    fn any_of_several_needles_matches() {
+        let n = needles(&["redis", "postgres"]);
+        assert!(proc_matches("postgres", "postgres: writer", &n, false));
+        assert!(!proc_matches("mysqld", "/usr/sbin/mysqld", &n, false));
+    }
+
+    #[test]
+    fn region_parsing() {
+        assert_eq!(parse_region("1000-2000").unwrap(), (0x1000, 0x2000));
+        assert_eq!(parse_region("0x1000-0x2000").unwrap(), (0x1000, 0x2000));
+        assert!(parse_region("2000-1000").is_err());
+        assert!(parse_region("nope").is_err());
+        assert!(parse_region("1000-zzzz").is_err());
+    }
 }

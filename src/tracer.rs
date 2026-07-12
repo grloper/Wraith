@@ -84,12 +84,17 @@ impl Summary {
     }
 }
 
-/// How the tracee was obtained, so `run` knows how to resume it.
+/// How the tracee(s) were obtained, so `run` knows how to seed and resume them.
 enum Target {
-    /// We forked and exec'd it; it is stopped at the post-exec SIGTRAP.
+    /// We forked and exec'd it; it is stopped at the post-exec SIGTRAP. We own
+    /// it, so it is killed with us on exit.
     Spawned(Pid),
-    /// We attached to an already-running process.
+    /// We attached to one already-running process. We do not own it, so it is
+    /// left running if we exit.
     Attached(Pid),
+    /// We attached to a whole set of already-running processes (`scan` mode).
+    /// Peers with no distinguished root; all left running if we exit.
+    ScanAttached(Vec<Pid>),
 }
 
 pub struct Tracer {
@@ -141,7 +146,8 @@ impl Tracer {
                         )));
                     }
                 }
-                set_options(child)?;
+                // We own this child, so tie its life to ours.
+                set_options(child, true)?;
                 let enforcement = cfg.enforcement;
                 Ok(Tracer {
                     target: Target::Spawned(child),
@@ -165,7 +171,8 @@ impl Tracer {
                 )));
             }
         }
-        set_options(child)?;
+        // Observing someone else's process: leave it running if we stop.
+        set_options(child, false)?;
         let enforcement = cfg.enforcement;
         Ok(Tracer {
             target: Target::Attached(child),
@@ -174,34 +181,76 @@ impl Tracer {
         })
     }
 
-    fn pid(&self) -> Pid {
-        match self.target {
-            Target::Spawned(p) => p,
-            Target::Attached(p) => p,
+    /// Attach to a whole set of already-running processes at once (`scan`
+    /// mode). Each pid is attached, waited for its stop, and configured
+    /// independently; a pid we cannot attach to (permission, or it exited
+    /// between enumeration and attach) is skipped rather than failing the
+    /// whole scan. Errors only if *nothing* could be attached.
+    pub fn attach_many(pids: &[i32], cfg: Config) -> io::Result<Self> {
+        let mut attached = Vec::new();
+        for &pid in pids {
+            let child = Pid::from_raw(pid);
+            if ptrace::attach(child).is_err() {
+                continue; // not ours / gone / already traced
+            }
+            match waitpid(child, None) {
+                Ok(WaitStatus::Stopped(_, _)) => {}
+                _ => {
+                    let _ = ptrace::detach(child, None);
+                    continue;
+                }
+            }
+            // Never kill-on-exit under scan: stopping the monitor must not take
+            // down every process it was watching.
+            if set_options(child, false).is_err() {
+                let _ = ptrace::detach(child, None);
+                continue;
+            }
+            attached.push(child);
         }
+        if attached.is_empty() {
+            return Err(io::Error::other(
+                "could not attach to any matching process (need CAP_SYS_PTRACE / ownership?)",
+            ));
+        }
+        let enforcement = cfg.enforcement;
+        Ok(Tracer {
+            target: Target::ScanAttached(attached),
+            detector: Detector::new(cfg),
+            enforcement,
+        })
     }
 
     /// Run the trace to completion — following every thread and child the
-    /// target spawns — invoking `on_event` for every detection. The trace ends
-    /// once the last tracee has exited.
+    /// target(s) spawn — invoking `on_event` for every detection. The trace
+    /// ends once the last tracee has exited.
     pub fn run<F>(mut self, mut on_event: F) -> io::Result<Summary>
     where
         F: FnMut(&Event),
     {
-        let root = self.pid();
         let mut summary = Summary::default();
+
+        // The tracee(s) to seed, and — for a single spawned/attached target —
+        // the one pid whose exit status the summary records. A `scan` has many
+        // peers and no distinguished root.
+        let (initial, root_pid): (Vec<Pid>, Option<i32>) = match &self.target {
+            Target::Spawned(p) | Target::Attached(p) => (vec![*p], Some(p.as_raw())),
+            Target::ScanAttached(pids) => (pids.clone(), None),
+        };
 
         // Per-thread phase, and per-address-space (tgid) cached maps. Threads
         // that share memory share an `AddrSpace` entry.
         let mut threads: HashMap<i32, ThreadState> = HashMap::new();
         let mut spaces: HashMap<i32, AddrSpace> = HashMap::new();
 
-        let root_tgid = read_tgid(root.as_raw());
-        threads.insert(root.as_raw(), ThreadState { at_entry: true, tgid: root_tgid });
-        spaces.insert(root_tgid, AddrSpace::new());
-
-        // Kick the root tracee toward its first syscall stop.
-        ptrace::syscall(root, None).map_err(nix_err)?;
+        // Seed every initial tracee and kick each toward its first syscall stop.
+        for p in &initial {
+            let raw = p.as_raw();
+            let tgid = read_tgid(raw);
+            threads.insert(raw, ThreadState { at_entry: true, tgid });
+            spaces.entry(tgid).or_insert_with(AddrSpace::new);
+            ptrace::syscall(*p, None).map_err(nix_err)?;
+        }
 
         loop {
             // Reap any tracee. `ECHILD` means every thread and child has gone.
@@ -231,7 +280,7 @@ impl Tracer {
             match status {
                 WaitStatus::Exited(_, code) => {
                     threads.remove(&raw);
-                    if raw == root.as_raw() {
+                    if Some(raw) == root_pid {
                         summary.exit_code = Some(code);
                     }
                     if threads.is_empty() {
@@ -240,7 +289,7 @@ impl Tracer {
                 }
                 WaitStatus::Signaled(_, sig, _) => {
                     threads.remove(&raw);
-                    if raw == root.as_raw() {
+                    if Some(raw) == root_pid {
                         summary.term_signal = Some(sig as i32);
                     }
                     if threads.is_empty() {
@@ -463,23 +512,23 @@ impl Tracer {
     }
 }
 
-fn set_options(pid: Pid) -> io::Result<()> {
+fn set_options(pid: Pid, kill_on_exit: bool) -> io::Result<()> {
     use ptrace::Options;
     // TRACESYSGOOD lets us tell syscall stops apart from signal stops.
-    // EXITKILL guarantees the tracee dies with us instead of being left
-    // orphaned and stopped if the tracer crashes.
     // TRACE{CLONE,FORK,VFORK} make every thread and child the target spawns a
     // tracee too, and are inherited by those descendants — so following the
     // whole process tree needs setting them only on the root.
-    ptrace::setoptions(
-        pid,
-        Options::PTRACE_O_TRACESYSGOOD
-            | Options::PTRACE_O_EXITKILL
-            | Options::PTRACE_O_TRACECLONE
-            | Options::PTRACE_O_TRACEFORK
-            | Options::PTRACE_O_TRACEVFORK,
-    )
-    .map_err(nix_err)
+    let mut opts = Options::PTRACE_O_TRACESYSGOOD
+        | Options::PTRACE_O_TRACECLONE
+        | Options::PTRACE_O_TRACEFORK
+        | Options::PTRACE_O_TRACEVFORK;
+    // EXITKILL ties the tracee's life to ours — right for a process we spawned
+    // and own, but wrong when merely observing someone else's process (attach /
+    // scan): stopping the monitor must not kill what it was watching.
+    if kill_on_exit {
+        opts |= Options::PTRACE_O_EXITKILL;
+    }
+    ptrace::setoptions(pid, opts).map_err(nix_err)
 }
 
 /// The pid a [`WaitStatus`] refers to, if it carries one.
