@@ -11,6 +11,11 @@ exploitation*, not the *identity of the bug*.
 > Built as the runtime-defence companion to [`ghost`](https://github.com/pandaadir05/ghost).
 > `ghost` finds weaknesses; `wraith` catches them being used.
 
+![Wraith's live scan dashboard: three clean workers and one process caught mid-exploitation](docs/scan-demo.svg)
+
+<p align="center"><em><code>wraith scan --ui --match netd</code> — one row per process with live syscall/event
+counters, and a correlated exploitation verdict the instant injected code issues a syscall.</em></p>
+
 ---
 
 ## The idea
@@ -115,6 +120,7 @@ Tuning:
 ```
 --jit-critical      treat anonymous-exec pages as HIGH (targets that never JIT)
 --trust-region A-B  treat the hex range [A,B) as legitimate JIT (repeatable)
+--ui                live full-screen dashboard instead of the log stream
 --no-stack-pivot    disable the ROP stack-pivot heuristic
 --audit-sensitive   log sensitive syscalls from legitimate code too
 --min <sev>         floor: info|warn|high|critical (default warn)
@@ -194,6 +200,27 @@ target. Caveats worth knowing:
   `PTRACE_O_EXITKILL`: stopping Wraith leaves every scanned process running.
 - **Post-attach threads only.** As with `attach`, sibling threads that already
   existed before Wraith attached aren't picked up automatically (see below).
+- **Never traces itself.** `scan` excludes its own process and its whole
+  ancestor chain (the shell/terminal that launched it), so a broad `--match`
+  can't accidentally attach to — and hang on — the tool that started it.
+
+### Live dashboard (`--ui`)
+
+Add `--ui` to any mode for a full-screen terminal dashboard instead of the
+scrolling log — the picture at the top of this README is exactly that, on the
+scan flow:
+
+```bash
+sudo wraith scan --ui --match nginx
+```
+
+One row per traced process with live syscall/event counters and a colour-coded
+verdict (`clean` → `suspicious` → `EXPLOITATION`), above a feed of the most
+recent detections and a status bar carrying the aggregate verdict. It repaints
+on every detection and at ~20 fps otherwise, restores the terminal cleanly on
+exit or Ctrl-C, and still honours `--json` (the event stream is written to the
+sink underneath the UI). The dashboard is hand-rolled ANSI — no TUI dependency
+— so the sensor's supply chain stays `nix` + `libc` only.
 
 ---
 
@@ -211,6 +238,7 @@ carry the smallest supply chain you can manage. The engine links only `nix` and
    ├─ detect.rs      the invariants + the exploitation-chain correlator
    ├─ event.rs       detection events + their JSONL form
    ├─ tracer.rs      the ptrace engine (spawn/attach/scan, thread-following, enforcement)
+   ├─ ui.rs          the live terminal dashboard (--ui), hand-rolled ANSI
    └─ bin/
        ├─ wraith.rs           the CLI sensor
        ├─ benign.rs           false-positive control target
@@ -275,7 +303,7 @@ ranges).
 
 ```bash
 cargo build --release
-cargo test          # 36 unit + 9 end-to-end tests
+cargo test          # 42 unit + 10 end-to-end tests
 cargo clippy --all-targets
 ./demo.sh           # side-by-side benign vs. exploitation run
 ```

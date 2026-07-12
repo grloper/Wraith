@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="905" height="286" viewBox="0 0 905 286" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">
+<rect x="0" y="0" width="905" height="286" rx="9" fill="#0d1117"/>
+<rect x="0" y="0" width="905" height="30" rx="9" fill="#161b22"/>
+<rect x="0" y="21" width="905" height="9" fill="#161b22"/>
+<circle cx="18" cy="15" r="6" fill="#ff5f56"/>
+<circle cx="36" cy="15" r="6" fill="#ffbd2e"/>
+<circle cx="54" cy="15" r="6" fill="#27c93f"/>
+<text x="452.5" y="19.0" fill="#8b949e" text-anchor="middle" font-size="12">wraith — live scan</text>
+<rect x="16.0" y="30.0" width="874.2" height="19" fill="#c9d1d9"/>
+<text x="16.0" y="44.0" fill="#0d1117" xml:space="preserve"> WRAITH — runtime exploitation sensor                                                             00:00 </text>
+<text x="889.6" y="44.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="63.0" fill="#6e7681" xml:space="preserve"> scan --match netd   ·   enforce: observe   ·   4 proc · 6 syscalls · 3 events</text>
+<text x="671.2" y="63.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="82.0" fill="#6e7681" xml:space="preserve">     PID PROCESS                                                         SYSCALLS EVENTS  VERDICT       </text>
+<text x="889.6" y="82.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="101.0" fill="#c9d1d9" xml:space="preserve">   17199 netd-cache                                                             1      0  </text>
+<text x="772.0" y="101.0" fill="#6e7681" xml:space="preserve">● clean       </text>
+<text x="889.6" y="101.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="120.0" fill="#c9d1d9" xml:space="preserve">   17201 netd-auth                                                              1      0  </text>
+<text x="772.0" y="120.0" fill="#6e7681" xml:space="preserve">● clean       </text>
+<text x="889.6" y="120.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="139.0" fill="#c9d1d9" xml:space="preserve">   17203 netd-log                                                               1      0  </text>
+<text x="772.0" y="139.0" fill="#6e7681" xml:space="preserve">● clean       </text>
+<text x="889.6" y="139.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="158.0" fill="#c9d1d9" xml:space="preserve">   17210 netd-api                                                               3      3  </text>
+<text x="772.0" y="158.0" fill="#ff7b72" font-weight="700" xml:space="preserve">● EXPLOITATION</text>
+<text x="889.6" y="158.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="177.0" fill="#6e7681" xml:space="preserve">── recent detections ───────────────────────────────────────────────────────────────────────────────────</text>
+<text x="889.6" y="177.0" fill="#c9d1d9" xml:space="preserve"></text>
+<text x="16.0" y="196.0" fill="#bc8cff" xml:space="preserve">     HIGH</text>
+<text x="91.6" y="196.0" fill="#c9d1d9" xml:space="preserve"> wx_violation mmap @ 0x7f7e1812534a [0x0]  `mmap` requests writable+executable memory — classi…</text>
+<text x="16.0" y="215.0" fill="#ff7b72" font-weight="700" xml:space="preserve"> CRITICAL</text>
+<text x="91.6" y="215.0" fill="#c9d1d9" xml:space="preserve"> foreign_origin_syscall socket @ 0x7f7e183a1011 [anon]  sensitive syscall `socket` issued from…</text>
+<text x="16.0" y="234.0" fill="#ff7b72" font-weight="700" xml:space="preserve"> CRITICAL</text>
+<text x="91.6" y="234.0" fill="#c9d1d9" xml:space="preserve"> exploitation_chain socket @ 0x7f7e183a1011 [correlated]  EXPLOITATION CHAIN: executable paylo…</text>
+<rect x="16.0" y="239.0" width="874.2" height="19" fill="#ff7b72"/>
+<text x="16.0" y="253.0" fill="#0d1117" font-weight="700" xml:space="preserve"> VERDICT: EXPLOITATION                                                            6 syscalls · 3 events </text>
+</svg>

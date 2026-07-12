@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use wraith::detect::Config;
 use wraith::event::{Event, Kind, Severity};
-use wraith::tracer::{Summary, Tracer};
+use wraith::tracer::{ProcStat, Reporter, Summary, Tracer};
 
 /// The tracer reaps its whole process tree with `waitpid(-1)`, which is exactly
 /// right for the real sensor (a dedicated process with a single tracer) but
@@ -250,4 +250,58 @@ fn observe_mode_never_intervenes() {
         !events.iter().any(|e| matches!(e.kind, Kind::Blocked | Kind::Killed)),
         "observe mode must not enforce"
     );
+}
+
+/// A [`Reporter`] that records what the live-UI path would see, so we can test
+/// the per-process stats plumbing that feeds the dashboard.
+#[derive(Clone)]
+struct Recorder {
+    events: Arc<Mutex<usize>>,
+    refreshes: Arc<Mutex<usize>>,
+    snapshot: Arc<Mutex<Vec<ProcStat>>>,
+}
+
+impl Reporter for Recorder {
+    fn event(&mut self, _ev: &Event) {
+        *self.events.lock().unwrap() += 1;
+    }
+    fn wants_refresh(&self) -> bool {
+        true
+    }
+    fn refresh(&mut self, stats: &[ProcStat], _summary: &Summary) {
+        *self.refreshes.lock().unwrap() += 1;
+        *self.snapshot.lock().unwrap() = stats.to_vec();
+    }
+}
+
+#[test]
+fn run_with_surfaces_per_process_stats() {
+    // The live-UI path (run_with + a refreshing Reporter) must accumulate
+    // per-process stats: the shellcode simulator should show syscalls, events,
+    // and a CRITICAL max-severity for its single process.
+    let _guard = trace_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let bin = env!("CARGO_BIN_EXE_shellcode-sim");
+    let rec = Recorder {
+        events: Arc::new(Mutex::new(0)),
+        refreshes: Arc::new(Mutex::new(0)),
+        snapshot: Arc::new(Mutex::new(Vec::new())),
+    };
+    let tracer = match Tracer::spawn(&[bin.to_string()], Config::default()) {
+        Ok(t) => t,
+        Err(_) => return, // ptrace unavailable — skip
+    };
+    let summary = tracer.run_with(rec.clone()).expect("run_with failed");
+
+    assert!(*rec.refreshes.lock().unwrap() > 0, "reporter was never refreshed");
+    assert!(*rec.events.lock().unwrap() > 0, "reporter saw no events");
+
+    let snap = rec.snapshot.lock().unwrap();
+    assert_eq!(snap.len(), 1, "expected exactly one traced process");
+    let p = &snap[0];
+    assert!(p.syscalls > 0, "process should have observed syscalls");
+    assert!(p.events > 0, "process should have accumulated events");
+    assert_eq!(p.max_severity, Some(Severity::Critical));
+    assert!(!p.alive, "process should be marked exited by the final frame");
+    assert_eq!(summary.max_severity, Some(Severity::Critical));
 }
