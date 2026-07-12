@@ -1,0 +1,36 @@
+[package]
+name = "wraith"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Signature-free runtime exploitation detection via syscall provenance verification"
+license = "MIT"
+repository = "https://github.com/grloper/cyber-rust"
+readme = "README.md"
+keywords = ["security", "edr", "exploit", "ptrace", "detection"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "wraith"
+path = "src/bin/wraith.rs"
+
+# Self-contained targets used by the test-suite and for live demos.
+# `benign` never triggers a detection; `shellcode-sim` stages and executes
+# code from an RWX anonymous mapping the way a real exploit payload does.
+[[bin]]
+name = "benign"
+path = "src/bin/benign.rs"
+
+[[bin]]
+name = "shellcode-sim"
+path = "src/bin/shellcode_sim.rs"
+
+[dependencies]
+nix = { version = "0.29", features = ["ptrace", "process", "signal"] }
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
