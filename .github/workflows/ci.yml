@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Build
+        run: cargo build --all-targets --verbose
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        # The end-to-end tests need ptrace; they self-skip where it is
+        # unavailable, so the suite stays green on constrained runners.
+        run: cargo test --verbose
