@@ -237,7 +237,8 @@ carry the smallest supply chain you can manage. The engine links only `nix` and
    ├─ syscalls.rs    the syscall table Wraith cares about
    ├─ detect.rs      the invariants + the exploitation-chain correlator
    ├─ event.rs       detection events + their JSONL form
-   ├─ tracer.rs      the ptrace engine (spawn/attach/scan, thread-following, enforcement)
+   ├─ engine.rs      the transport-agnostic detection core (Backend trait, Engine)
+   ├─ tracer.rs      the ptrace Backend (spawn/attach/scan, thread-following, enforcement)
    ├─ ui.rs          the live terminal dashboard (--ui), hand-rolled ANSI
    └─ bin/
        ├─ wraith.rs           the CLI sensor
@@ -250,6 +251,15 @@ carry the smallest supply chain you can manage. The engine links only `nix` and
 The tracer adds no syscall of its own on the hot path beyond the unavoidable
 `getregs`, and re-reads `/proc/<pid>/maps` only when a memory operation could
 have changed it.
+
+**Transport-agnostic core.** Detection is split from transport behind a
+`Backend` trait. The `ptrace` tracer is the first backend: it captures each
+syscall-entry into a neutral register snapshot and hands it to the shared
+`Engine`, which owns the cached memory map, the per-process stats, the detector,
+and the enforce-on-CRITICAL policy — and never issues a `ptrace` call itself.
+The same `Engine` drives any transport unchanged, so the planned eBPF backend
+(below) reuses the entire detection model and only swaps how a syscall stop is
+obtained.
 
 **Thread-following.** Real targets — network daemons, request handlers, fuzz
 harnesses — are multithreaded, and an exploit can fire from any thread. Wraith
@@ -270,7 +280,11 @@ claim to be a finished EDR.
   (network daemons, parsers, fuzz targets), not the whole system. The
   production path is the same logic on **eBPF** (`tracepoint/raw_syscalls` +
   a page-provenance map) for near-zero overhead — the detection model is
-  transport-agnostic by design.
+  transport-agnostic by design, and now lives behind a `Backend` trait
+  (`src/engine.rs`) so that eBPF backend slots in beside the `ptrace` one
+  without touching detection. (eBPF observes rather than stops, so it would be
+  the low-overhead *observe* backend; `ptrace` stays for lossless capture and
+  `--block`/`--kill`, which need the tracee held at syscall entry.)
 - **Attach vs. pre-existing threads.** `wraith run` and `wraith attach` follow
   every thread and child the target spawns *after* tracing begins (via
   `PTRACE_O_TRACECLONE`/`FORK`/`VFORK`). When attaching to an already-running

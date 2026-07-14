@@ -37,10 +37,12 @@
 //! - [`syscalls`] — the syscall table Wraith cares about.
 //! - [`detect`] — the rules and the exploitation-chain correlator.
 //! - [`event`] — detection events and their JSON form.
-//! - [`tracer`] — the `ptrace` engine that drives a target.
+//! - [`engine`] — the transport-agnostic detection core ([`Backend`], [`Engine`]).
+//! - [`tracer`] — the `ptrace` [`Backend`] that drives a target.
 //! - [`ui`] — the live terminal dashboard (`--ui`).
 
 pub mod detect;
+pub mod engine;
 pub mod event;
 pub mod maps;
 pub mod provenance;
@@ -49,6 +51,7 @@ pub mod tracer;
 pub mod ui;
 
 pub use detect::{Config, Detector, Enforcement, SyscallCtx};
+pub use engine::{Backend, Engine, ProcStat, Reporter, Summary};
 pub use event::{Event, Kind, Severity};
-pub use tracer::{ProcStat, Reporter, Summary, Tracer};
+pub use tracer::Tracer;
 pub use ui::{Dashboard, TerminalGuard};
