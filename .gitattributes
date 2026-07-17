@@ -1,0 +1,7 @@
+# Normalize line endings on commit; let Git pick per-platform on checkout.
+* text=auto
+
+# Shell scripts must keep LF endings on every platform. A CRLF checkout on
+# Windows turns the `#!/usr/bin/env bash` shebang into `bash\r`, which the
+# kernel then fails to resolve ("/usr/bin/env: 'bash\r': No such file...").
+*.sh text eol=lf
