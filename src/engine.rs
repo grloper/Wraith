@@ -311,12 +311,22 @@ impl Engine {
         self.summary.term_signal = Some(sig);
     }
 
-    /// Flip a process's live-stats row to "exited". A backend calls this once
-    /// the last thread of `tgid` is gone.
+    /// Flip a process's live-stats row to "exited" and release the state that is
+    /// no longer needed now that its last thread is gone. A backend calls this
+    /// once the last thread of `tgid` has exited.
+    ///
+    /// The cached memory map (by far the largest per-process allocation — a
+    /// `Vec` of every mapped region, each with its path) and the detector's
+    /// per-process chain accumulator are dropped, so tracing a long-lived target
+    /// that spawns many short-lived children no longer leaks memory without
+    /// bound. The lightweight stats row is deliberately kept (only flipped to
+    /// "exited") so the UI can still show the process that just finished.
     pub fn mark_dead(&mut self, tgid: i32) {
         if let Some(s) = self.stats.get_mut(&tgid) {
             s.alive = false;
         }
+        self.spaces.remove(&tgid);
+        self.detector.retire(tgid);
     }
 
     /// Push a live snapshot to the reporter. When `force` is false the paint is
@@ -366,5 +376,26 @@ fn read_comm(pid: i32) -> String {
     match fs::read_to_string(format!("/proc/{pid}/comm")) {
         Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => pid.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detect::Config;
+
+    #[test]
+    fn dead_process_frees_space_but_keeps_stats_row() {
+        let mut e = Engine::new(Config::default());
+        e.register_space(4242);
+        assert!(e.spaces.contains_key(&4242));
+        assert!(e.stats.contains_key(&4242));
+
+        e.mark_dead(4242);
+
+        // The stats row survives (flipped to exited) so the UI can show it...
+        assert_eq!(e.stats.get(&4242).map(|s| s.alive), Some(false));
+        // ...but the heavy cached map is released, bounding memory on long traces.
+        assert!(!e.spaces.contains_key(&4242), "dead space must be freed");
     }
 }

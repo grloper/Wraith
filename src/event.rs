@@ -153,10 +153,21 @@ impl Event {
             self.kind.as_str(),
             self.syscall,
             self.rip,
-            self.origin,
+            sanitize_display(&self.origin),
             self.detail,
         )
     }
+}
+
+/// Strip terminal control characters from an untrusted string before it reaches
+/// a TTY. A region's label comes from the mapped file's path and a process's
+/// name comes from `/proc/<pid>/comm` — both attacker-influenceable — so without
+/// this a hostile process could smuggle ANSI escape sequences into the operator's
+/// display to rewrite or hide a detection row. Printable Unicode is preserved;
+/// only control characters (C0, C1, DEL) are removed. The JSON sink neutralises
+/// the same bytes differently, escaping them numerically (see [`json_escape`]).
+pub fn sanitize_display(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Escape the characters that would break a JSON string literal.
@@ -214,5 +225,27 @@ mod tests {
         assert!(l.contains("pid=7"));
         assert!(l.contains("wx_violation"));
         assert!(l.contains("mprotect"));
+    }
+
+    #[test]
+    fn sanitize_strips_control_but_keeps_printable() {
+        // Control characters (here a clear-screen ANSI sequence) are removed;
+        // the surrounding printable text — including non-ASCII — survives.
+        assert_eq!(sanitize_display("evil\x1b[2Jname"), "evil[2Jname");
+        assert_eq!(sanitize_display("café-server"), "café-server");
+        assert_eq!(sanitize_display("a\r\n\tb"), "ab");
+    }
+
+    #[test]
+    fn line_neutralizes_hostile_origin_label() {
+        // A mapped-file label carrying an escape sequence must not reach the TTY
+        // as a live escape — the raw clear-screen bytes are gone from the line.
+        let e = Event::now(
+            1, Severity::High, Kind::ForeignOriginSyscall, "execve",
+            0x1000, 0x2000, "eviltool\x1b[2J\x1b[H", "injected code is now acting",
+        );
+        let l = e.to_line(false);
+        assert!(!l.contains('\x1b'), "escape from origin must be stripped: {l:?}");
+        assert!(l.contains("eviltool"), "sanitised label text should remain: {l:?}");
     }
 }

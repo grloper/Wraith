@@ -6,7 +6,7 @@
 //!   wraith scan [OPTIONS] (--match <s> | --all)    monitor many running procs
 //!
 //! Options:
-//!   --json <FILE|->      also write JSONL events (`-` for stdout)
+//!   --json <FILE|->      also write JSONL events (`-` for stdout; a FILE is appended)
 //!   --min <SEV>          minimum severity to report: info|warn|high|critical
 //!   --jit-critical       treat anonymous-exec origins as HIGH (no-JIT targets)
 //!   --trust-region A-B   treat the hex range [A,B) as legitimate JIT (repeatable)
@@ -14,13 +14,15 @@
 //!   --kill               SIGKILL the traced tree on detection
 //!   --match <substr>     (scan) attach to processes whose name/cmdline matches
 //!   --all                (scan) attach to every process we're allowed to trace
+//!   --max-targets <N>    (scan) attach to at most N matching processes
 //!   --ui                 live full-screen dashboard instead of the log stream
 //!   --no-stack-pivot     disable the ROP stack-pivot heuristic
 //!   --audit-sensitive    also log sensitive syscalls from legitimate code
 //!   --quiet              suppress the human event stream (use with --json)
+//!   -V, --version        print the wraith version and exit
 //!   -h, --help           show this help
 
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
@@ -54,6 +56,13 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // Version is essential for incident response: a log is only as useful as
+    // knowing exactly which build produced it.
+    if args[0] == "-V" || args[0] == "--version" {
+        println!("wraith {}", env!("CARGO_PKG_VERSION"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mode = args[0].clone();
     let rest = &args[1..];
 
@@ -71,6 +80,7 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     let mut attach_pid: Option<i32> = None;
     let mut scan_matches: Vec<String> = Vec::new();
     let mut scan_all = false;
+    let mut max_targets: Option<usize> = None;
 
     while i < rest.len() {
         let a = &rest[i];
@@ -102,6 +112,16 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                 scan_matches.push(v.clone());
             }
             "--all" => scan_all = true,
+            "--max-targets" => {
+                i += 1;
+                let v = rest.get(i).ok_or_else(|| bad("--max-targets needs a number"))?;
+                max_targets = Some(
+                    v.parse::<usize>()
+                        .ok()
+                        .filter(|&n| n > 0)
+                        .ok_or_else(|| bad("--max-targets must be a positive integer"))?,
+                );
+            }
             "--ui" | "--dashboard" => opts.ui = true,
             "--no-stack-pivot" => opts.cfg.detect_stack_pivot = false,
             "--audit-sensitive" => opts.cfg.audit_sensitive = true,
@@ -122,7 +142,11 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     let json_sink: Option<Box<dyn Write>> = match opts.json.as_deref() {
         None => None,
         Some("-") => Some(Box::new(io::stdout())),
-        Some(path) => Some(Box::new(File::create(path)?)),
+        // Append rather than truncate: a JSONL evidence log must never lose prior
+        // detections just because the sensor is re-run against the same file.
+        Some(path) => Some(Box::new(
+            OpenOptions::new().create(true).append(true).open(path)?,
+        )),
     };
     let min = opts.min;
     let quiet = opts.quiet;
@@ -132,6 +156,15 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     if ui && !io::stderr().is_terminal() {
         return Err(bad(
             "--ui needs an interactive terminal on stderr; drop --ui, or use --json for a stream",
+        ));
+    }
+
+    // Everything downstream — memory maps, tgids, comm names — reads /proc. Fail
+    // early and clearly if it isn't mounted/readable (some restricted or rootless
+    // containers) instead of deep inside the trace with a cryptic error.
+    if std::fs::metadata("/proc/self/maps").is_err() {
+        return Err(bad(
+            "/proc is not available or readable — Wraith needs a mounted procfs to inspect memory maps",
         ));
     }
 
@@ -173,9 +206,21 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                     "scan needs a filter: --match <substring> (repeatable) or --all",
                 ));
             }
-            let pids = enumerate_scan_pids(&scan_matches, scan_all);
+            let mut pids = enumerate_scan_pids(&scan_matches, scan_all);
             if pids.is_empty() {
                 return Err(bad("scan matched no running processes"));
+            }
+            // Attaching adds two ptrace stops per syscall to every target, so a
+            // broad `--all` on a busy host can bog the system down. `--max-targets`
+            // caps how many we take on.
+            if let Some(max) = max_targets {
+                if pids.len() > max {
+                    eprintln!(
+                        "wraith: --max-targets {max}: watching {max} of {} matching process(es)",
+                        pids.len()
+                    );
+                    pids.truncate(max);
+                }
             }
             let filter = if scan_all {
                 "--all".to_string()
@@ -207,13 +252,22 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     } else {
         // Plain stream: colored log lines to stderr, optional JSONL to the sink.
         let mut json_sink = json_sink;
+        let mut json_broken = false;
         let mut on_event = |ev: &Event| {
             if ev.severity >= min {
                 if !quiet {
                     let _ = writeln!(io::stderr(), "{}", ev.to_line(color));
                 }
                 if let Some(sink) = json_sink.as_mut() {
-                    let _ = writeln!(sink, "{}", ev.to_json());
+                    // Don't swallow a failed write: for a security sensor a lost
+                    // detection is the worst outcome. Warn once so a full disk or
+                    // broken pipe is visible without flooding stderr.
+                    if writeln!(sink, "{}", ev.to_json()).is_err() && !json_broken {
+                        json_broken = true;
+                        eprintln!(
+                            "wraith: warning: writing to the JSON sink failed — later events may be missing from it"
+                        );
+                    }
                 }
             }
         };
@@ -333,6 +387,16 @@ fn parse_region(s: &str) -> io::Result<(u64, u64)> {
     if end <= start {
         return Err(bad("--trust-region END must be greater than START"));
     }
+    // A trusted region exempts its whole span from provenance and W^X checks, so
+    // an accidentally huge range (a typo like `0-ffffffffffffffff`) would quietly
+    // blind the sensor. Real JIT arenas are megabytes; warn well above that.
+    const HUGE_SPAN: u64 = 1 << 32; // 4 GiB
+    if end - start > HUGE_SPAN {
+        eprintln!(
+            "wraith: warning: --trust-region {s} spans {} bytes — this exempts a very large area from detection; double-check the range",
+            end - start
+        );
+    }
     Ok((start, end))
 }
 
@@ -358,7 +422,7 @@ wraith run [OPTIONS] -- <program> [args...]   spawn and monitor a program\n  \
 wraith attach [OPTIONS] <pid>                 monitor one running process\n  \
 wraith scan [OPTIONS] (--match <s> | --all)   monitor many running processes\n\n\
 OPTIONS:\n  \
---json <FILE|->      also write JSONL events (`-` = stdout)\n  \
+--json <FILE|->      also write JSONL events (`-` = stdout; a FILE is appended, not truncated)\n  \
 --min <SEV>          minimum severity to report: info|warn|high|critical (default: warn)\n  \
 --jit-critical       treat anonymous-exec origins as HIGH (targets that never JIT)\n  \
 --trust-region A-B    treat the hex range [A,B) as legitimate JIT (repeatable)\n  \
@@ -366,10 +430,12 @@ OPTIONS:\n  \
 --kill               SIGKILL the traced tree on exploitation (CRITICAL)\n  \
 --match <substr>     (scan) attach to processes whose name/cmdline matches (repeatable)\n  \
 --all                (scan) attach to every process we're allowed to trace\n  \
+--max-targets <N>    (scan) attach to at most N matching processes\n  \
 --ui                 live full-screen dashboard (per-process rows + event feed)\n  \
 --no-stack-pivot     disable the ROP stack-pivot heuristic\n  \
 --audit-sensitive    also log sensitive syscalls from legitimate code\n  \
 --quiet              suppress the human stream (pair with --json)\n  \
+-V, --version        print the wraith version and exit\n  \
 -h, --help           show this help\n\n\
 ENFORCEMENT:\n  \
 Detection is always on. --block and --kill add active response and fire only on\n  \

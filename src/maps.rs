@@ -104,14 +104,21 @@ impl MemoryMap {
     /// aborting the trace, since a single unexpected line should never blind
     /// the detector.
     pub fn parse(raw: &str) -> Self {
-        let regions = raw.lines().filter_map(parse_line).collect();
+        let mut regions: Vec<Region> = raw.lines().filter_map(parse_line).collect();
+        // The kernel already emits `/proc/<pid>/maps` sorted by start address,
+        // but sort defensively so the binary search in `region_at` stays correct
+        // even against an oddly-ordered source (e.g. a FUSE-mounted procfs).
+        regions.sort_by_key(|r| r.start);
         Self { regions }
     }
 
-    /// The region containing `addr`, if any. Regions never overlap, so the
-    /// first hit is the answer.
+    /// The region containing `addr`, if any. Regions are sorted by start address
+    /// and never overlap, so a binary search for the first region ending past
+    /// `addr` finds the only candidate in `O(log n)` — this is on the hot path,
+    /// queried for `rip`, `rsp`, and memory-op targets on every syscall.
     pub fn region_at(&self, addr: u64) -> Option<&Region> {
-        self.regions.iter().find(|r| r.contains(addr))
+        let idx = self.regions.partition_point(|r| r.end <= addr);
+        self.regions.get(idx).filter(|r| r.contains(addr))
     }
 
     pub fn regions(&self) -> &[Region] {
@@ -168,6 +175,11 @@ fn parse_line(line: &str) -> Option<Region> {
     let (start_s, end_s) = range.split_once('-')?;
     let start = u64::from_str_radix(start_s, 16).ok()?;
     let end = u64::from_str_radix(end_s, 16).ok()?;
+    // A real region is a non-empty half-open range; drop anything degenerate so
+    // it can never poison the sorted-and-disjoint invariant `region_at` relies on.
+    if start >= end {
+        return None;
+    }
     let (read, write, exec, shared) = parse_perms(perms)?;
 
     Some(Region {
@@ -228,5 +240,59 @@ mod tests {
         let libc = m.region_at(0x7f2c9c000100).unwrap();
         assert!(libc.exec && !libc.write);
         assert_eq!(libc.label(), "libc.so.6");
+    }
+
+    #[test]
+    fn binary_search_matches_linear_scan() {
+        // The O(log n) `region_at` must agree with a naive linear scan for every
+        // address: region starts and ends, interiors, boundaries, and gaps.
+        let m = MemoryMap::parse(SAMPLE);
+        let linear = |addr: u64| m.regions().iter().find(|r| r.contains(addr));
+        let mut probes = vec![0u64, 1, u64::MAX];
+        for r in m.regions() {
+            probes.extend([
+                r.start.wrapping_sub(1),
+                r.start,
+                r.start + 1,
+                r.end.wrapping_sub(1),
+                r.end,
+                r.end + 1,
+            ]);
+        }
+        for addr in probes {
+            assert_eq!(
+                m.region_at(addr).map(|r| r.start),
+                linear(addr).map(|r| r.start),
+                "mismatch at {addr:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn regions_are_sorted_even_from_unordered_input() {
+        // A source that lists regions out of order must still yield a sorted map
+        // so the binary search holds.
+        let unordered = "\
+7f0000000000-7f0000001000 r-xp 0 08:01 1 /b
+5500000000-5500001000 r-xp 0 08:01 2 /a";
+        let m = MemoryMap::parse(unordered);
+        let starts: Vec<u64> = m.regions().iter().map(|r| r.start).collect();
+        assert_eq!(starts, [0x5500000000, 0x7f0000000000]);
+        assert!(m.region_at(0x5500000500).is_some());
+        assert!(m.region_at(0x7f0000000500).is_some());
+    }
+
+    #[test]
+    fn degenerate_and_malformed_lines_are_dropped() {
+        // An empty range (start == end) and a truncated line must be skipped
+        // rather than parsed into a poisonous region.
+        let bad = "\
+55f000001000-55f000001000 r-xp 0 08:01 1 /zero-length
+55f000002000-55f000003000 r-xp 0 08:01 2 /ok
+this is not a maps line";
+        let m = MemoryMap::parse(bad);
+        assert_eq!(m.regions().len(), 1);
+        assert!(m.region_at(0x55f000001000).is_none());
+        assert!(m.region_at(0x55f000002500).is_some());
     }
 }

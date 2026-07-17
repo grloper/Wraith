@@ -20,7 +20,7 @@ use std::time::Instant;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
 
 use crate::detect::Enforcement;
-use crate::event::{Event, Severity};
+use crate::event::{sanitize_display, Event, Severity};
 use crate::tracer::{ProcStat, Reporter, Summary};
 
 /// How many recent detections to retain for the feed (only the tail is drawn).
@@ -36,6 +36,11 @@ pub struct Dashboard {
     started: Instant,
     feed: VecDeque<Event>,
     json: Option<Box<dyn Write>>,
+    /// Set once a write to the JSON sink fails. In the TUI stderr is the alternate
+    /// screen, so a failure can't be logged there without corrupting the display;
+    /// instead it is surfaced as a banner in the frame so the operator knows the
+    /// evidence log may be incomplete.
+    sink_error: bool,
 }
 
 impl Dashboard {
@@ -56,6 +61,7 @@ impl Dashboard {
             started: Instant::now(),
             feed: VecDeque::new(),
             json,
+            sink_error: false,
         }
     }
 
@@ -80,7 +86,7 @@ impl Dashboard {
             Enforcement::Block => "block",
             Enforcement::Kill => "kill",
         };
-        let subtitle = format!(
+        let mut subtitle = format!(
             " {}   ·   enforce: {}   ·   {} proc · {} syscalls · {} events",
             self.mode,
             enforce,
@@ -88,6 +94,9 @@ impl Dashboard {
             human(summary.syscalls_seen),
             human(summary.events),
         );
+        if self.sink_error {
+            subtitle.push_str("   ·   ⚠ JSON SINK WRITE FAILED — log may be incomplete");
+        }
         out.push(dim(&clip(&subtitle, cols)));
 
         // Tiny terminals: stop after the header so we never overflow.
@@ -185,7 +194,12 @@ impl Reporter for Dashboard {
             return;
         }
         if let Some(sink) = self.json.as_mut() {
-            let _ = writeln!(sink, "{}", ev.to_json());
+            // A failed write (full disk, broken pipe) must not be swallowed: for a
+            // security sensor a lost detection is the worst possible outcome, so
+            // remember it and let the frame flag it to the operator.
+            if writeln!(sink, "{}", ev.to_json()).and_then(|_| sink.flush()).is_err() {
+                self.sink_error = true;
+            }
         }
         self.feed.push_back(ev.clone());
         if self.feed.len() > FEED_CAP {
@@ -213,7 +227,9 @@ fn proc_row(s: &ProcStat, name_w: usize, cols: usize) -> String {
     let prefix = format!(
         "  {:>6} {} {:>8} {:>6}  ",
         s.tgid,
-        padr(&s.name, name_w),
+        // The process name comes from `/proc/<pid>/comm`; strip any control
+        // characters so a hostile process cannot inject ANSI into the table.
+        padr(&sanitize_display(&s.name), name_w),
         clip(&human(s.syscalls), 8),
         clip(&human(s.events), 6),
     );
@@ -234,7 +250,9 @@ fn event_row(ev: &Event, cols: usize) -> String {
         ev.kind.as_str(),
         ev.syscall,
         ev.rip,
-        ev.origin,
+        // Origin is a mapped-file label — attacker-influenceable — so neutralise
+        // any embedded terminal escapes before it hits the feed.
+        sanitize_display(&ev.origin),
         ev.detail,
     );
     format!("{head}{}", clip(&rest, cols.saturating_sub(9)))
@@ -547,5 +565,48 @@ mod tests {
         let dead = proc_row(&stat(1, "x", 0, 0, None, false), 10, 80);
         assert!(alive.contains('●'));
         assert!(dead.contains('○'));
+    }
+
+    #[test]
+    fn proc_row_neutralizes_hostile_process_name() {
+        // A comm containing a clear-screen escape must never emit the live escape
+        // into the table; the neutered literal text remains.
+        let row = proc_row(&stat(1, "evil\x1b[2Jname", 0, 0, None, true), 20, 80);
+        assert!(!row.contains("\x1b[2J"), "clear-screen escape from comm must be stripped");
+        assert!(strip_ansi(&row).contains("evil[2Jname"));
+    }
+
+    #[test]
+    fn event_row_neutralizes_hostile_origin() {
+        let ev = Event::now(1, Severity::High, Kind::WxViolation, "mmap", 0x10, 0x20, "lbl\x1b[2Jx", "d");
+        let row = event_row(&ev, 200);
+        assert!(!row.contains("\x1b[2J"), "escape from origin label must be stripped");
+    }
+
+    #[test]
+    fn json_sink_failure_is_surfaced_in_frame() {
+        // A writer that always fails stands in for a full disk / broken pipe.
+        struct FailWriter;
+        impl io::Write for FailWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("sink is full"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut d = Dashboard::new(
+            "run".into(),
+            Enforcement::Observe,
+            Severity::Warn,
+            Some(Box::new(FailWriter)),
+        );
+        d.event(&Event::now(1, Severity::High, Kind::WxViolation, "mmap", 0, 0, "anon", "x"));
+        assert!(d.sink_error, "a failed sink write must be recorded");
+        let frame = d.frame(&[], &Summary::default(), 120, 24).join("\n");
+        assert!(
+            frame.contains("JSON SINK WRITE FAILED"),
+            "the frame must warn the operator that the log may be incomplete:\n{frame}"
+        );
     }
 }
