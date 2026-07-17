@@ -41,6 +41,16 @@
 //! - [`tracer`] — the `ptrace` [`Backend`] that drives a target.
 //! - [`ui`] — the live terminal dashboard (`--ui`).
 
+// Wraith decodes syscall arguments straight out of the x86-64 `user_regs_struct`
+// (`orig_rax`, `rip`, `rsp`, `rdi`…) and keys off x86-64 syscall numbers. Those
+// are architecture-specific, so refuse to build anywhere else with a clear
+// message rather than failing deep inside the tracer with a missing-field error.
+#[cfg(not(target_arch = "x86_64"))]
+compile_error!(
+    "Wraith currently supports x86-64 Linux only: its syscall table and register \
+     decoding are x86-64-specific. Build on an x86-64 host."
+);
+
 pub mod detect;
 pub mod engine;
 pub mod event;

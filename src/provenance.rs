@@ -7,7 +7,7 @@
 //! fingerprint of code that was injected or reached through corrupted control
 //! flow.
 
-use crate::maps::{MemoryMap, Region, RegionKind};
+use crate::maps::{MemoryMap, RegionKind};
 
 /// Where a syscall instruction was executing from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,11 +150,6 @@ impl Prot {
     pub fn is_wx(self) -> bool {
         self.write && self.exec
     }
-}
-
-/// Convenience: is this region one an attacker would stage a payload in?
-pub fn is_payload_capable(region: &Region) -> bool {
-    region.write && region.exec
 }
 
 #[cfg(test)]

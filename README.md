@@ -105,7 +105,7 @@ catches every stage and correlates them into one verdict.
 
 | Event | Severity | Meaning |
 |---|---|---|
-| `foreign_origin_syscall` | HIGH / CRITICAL | A syscall issued from non-code memory (heap/stack/anon/RWX). CRITICAL when the syscall is *sensitive* (execve, connect, ptrace, …). |
+| `foreign_origin_syscall` | HIGH / CRITICAL | A syscall issued from non-code memory (heap/stack/anon/RWX). CRITICAL when the syscall is *sensitive* — program execution (`execve`, `memfd_create`), networking/exfil (`connect`, `sendto`), process tampering (`ptrace`, `process_vm_writev`), defence evasion (`seccomp`, `bpf`, `prctl`), or container escape (`setns`, `unshare`), among others. |
 | `wx_violation` | HIGH | `mmap`/`mprotect` requesting writable **and** executable memory. |
 | `wx_transition` | HIGH | A writable page being flipped to executable — payload staging. |
 | `stack_pivot` | HIGH | Stack pointer sitting in the heap or a file image at syscall time — a ROP indicator. |
@@ -123,6 +123,7 @@ Tuning:
 --ui                live full-screen dashboard instead of the log stream
 --no-stack-pivot    disable the ROP stack-pivot heuristic
 --audit-sensitive   log sensitive syscalls from legitimate code too
+--max-targets N     (scan) attach to at most N matching processes
 --min <sev>         floor: info|warn|high|critical (default warn)
 ```
 

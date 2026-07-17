@@ -246,7 +246,7 @@ impl Tracer {
     ) {
         let (syscall, rip, rsp) = ptrace::getregs(who)
             .map(|r| (syscalls::name(r.orig_rax), r.rip.wrapping_sub(2), r.rsp))
-            .unwrap_or_else(|_| ("?".to_string(), 0, 0));
+            .unwrap_or_else(|_| (std::borrow::Cow::Borrowed("?"), 0, 0));
 
         // One SIGKILL per distinct thread-group is enough to take down all of
         // its threads; de-duplicating avoids redundant signals.
@@ -384,10 +384,20 @@ impl Backend for Tracer {
                     }
                 }
                 WaitStatus::PtraceSyscall(_) => {
-                    let tgid = threads[&raw].tgid;
+                    // The vacant-entry check above guarantees `raw` is known here;
+                    // still, read it fallibly rather than index-and-panic, so a
+                    // phantom stop from a kernel/wait race can never crash the
+                    // sensor. An unattributable stop is simply resumed.
+                    let (at_entry, tgid) = match threads.get(&raw) {
+                        Some(ts) => (ts.at_entry, ts.tgid),
+                        None => {
+                            let _ = ptrace::syscall(who, None);
+                            continue;
+                        }
+                    };
                     let mut killed = false;
                     let mut event_fired = false;
-                    if threads[&raw].at_entry {
+                    if at_entry {
                         // Count the syscall first, so a lost `getregs` still
                         // registers as work the tracee did, then inspect it.
                         engine.count_syscall(tgid);
@@ -413,8 +423,9 @@ impl Backend for Tracer {
                             }
                         }
                     }
-                    let ts = threads.get_mut(&raw).unwrap();
-                    ts.at_entry = !ts.at_entry;
+                    if let Some(ts) = threads.get_mut(&raw) {
+                        ts.at_entry = !ts.at_entry;
+                    }
                     // Resume. After a kill the tracee is stopped with a pending
                     // SIGKILL; restarting it lets the kernel deliver it, and the
                     // call racing with the process's death is expected, so a
@@ -431,7 +442,10 @@ impl Backend for Tracer {
                     // A real signal was delivered to the tracee (not a syscall
                     // stop). Fatal memory-safety signals are worth surfacing as
                     // a possible failed exploit, then we forward the signal.
-                    let tgid = threads[&raw].tgid;
+                    let Some(tgid) = threads.get(&raw).map(|t| t.tgid) else {
+                        ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
+                        continue;
+                    };
                     engine.register_space(tgid);
                     let fired = self.on_signal(who, tgid, sig, &mut engine, reporter);
                     ptrace::syscall(who, Some(sig)).map_err(nix_err)?;

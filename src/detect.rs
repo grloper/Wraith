@@ -275,6 +275,14 @@ impl Detector {
 
         events
     }
+
+    /// Forget all accumulated evidence for an address space whose last thread
+    /// has exited. Without this the per-process chain map grows for the life of
+    /// the trace — a slow leak when following a long-lived target that forks or
+    /// spawns many short-lived children. A recycled key simply starts fresh.
+    pub fn retire(&mut self, proc_key: i32) {
+        self.chains.remove(&proc_key);
+    }
 }
 
 fn foreign_severity(cfg: &Config, origin: Origin, sensitive: bool) -> Severity {
@@ -450,5 +458,25 @@ mod tests {
         let second = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(first.iter().any(|e| e.kind == Kind::ExploitationChain));
         assert!(!second.iter().any(|e| e.kind == Kind::ExploitationChain));
+    }
+
+    #[test]
+    fn retire_frees_chain_state_and_resets_correlation() {
+        let mut d = Detector::new(Config::default());
+        let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+        // Stage a W^X milestone so the address space has accumulated evidence.
+        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        assert!(d.chains.contains_key(&1), "staging should record chain state");
+
+        d.retire(1);
+        assert!(!d.chains.contains_key(&1), "retire must free the chain entry");
+
+        // A recycled key starts clean: a lone foreign-origin sensitive syscall
+        // has no prior staging to correlate with, so no chain is reported.
+        let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
+        assert!(
+            !ev.iter().any(|e| e.kind == Kind::ExploitationChain),
+            "retired state must not resurrect an exploitation chain"
+        );
     }
 }
