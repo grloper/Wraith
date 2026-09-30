@@ -1,11 +1,10 @@
 //! Syscall provenance classification.
 //!
 //! Given the instruction pointer of a stopped tracee and its current memory
-//! map, decide where the syscall *came from*. Benign programs only ever issue
-//! syscalls from file-backed executable pages (their own `.text`, a shared
-//! library, or the kernel vDSO). Everything else is, to varying degrees, the
-//! fingerprint of code that was injected or reached through corrupted control
-//! flow.
+//! map, decide where the syscall *came from*. Ordinary native code uses
+//! executable images, libraries, or the kernel vDSO. Anonymous executable pages
+//! also host legitimate JIT code; anomalous provenance is evidence to assess,
+//! not proof of injection. Stale or unavailable maps can make it uncertain.
 
 use crate::maps::{MemoryMap, RegionKind};
 
@@ -33,7 +32,8 @@ pub enum Origin {
 }
 
 impl Origin {
-    /// True for origins that never occur during legitimate execution.
+    /// True for origins needing policy assessment, including legitimate JIT
+    /// code and map uncertainty. An anomaly alone does not prove injection.
     pub fn is_anomalous(self) -> bool {
         !matches!(self, Origin::LegitCode | Origin::Vdso)
     }
@@ -58,10 +58,6 @@ pub fn classify_rip(map: &MemoryMap, rip: u64) -> Origin {
         return Origin::Unmapped;
     };
 
-    if matches!(region.kind, RegionKind::Kernel) {
-        return Origin::Vdso;
-    }
-
     if !region.exec {
         return Origin::NonExec;
     }
@@ -78,7 +74,7 @@ pub fn classify_rip(map: &MemoryMap, rip: u64) -> Origin {
         RegionKind::Heap => Origin::HeapExec,
         RegionKind::File(_) => Origin::LegitCode,
         RegionKind::Anonymous => Origin::AnonExec,
-        RegionKind::Kernel => Origin::Vdso, // handled above; here for exhaustiveness
+        RegionKind::Kernel => Origin::Vdso,
     }
 }
 
@@ -89,8 +85,8 @@ pub enum StackState {
     Normal,
     /// Stack pointer sits in the heap — a classic ROP stack pivot target.
     PivotedToHeap,
-    /// Stack pointer sits in a file-backed region — an impossible place for a
-    /// real stack, so almost certainly a pivot into attacker-chosen data.
+    /// Stack pointer sits in a file-backed region: unusual for ordinary stacks,
+    /// but possible for explicitly allocated alternate stacks or custom runtimes.
     PivotedToFile,
     /// Stack pointer is not in any mapped region.
     Unmapped,
@@ -113,10 +109,10 @@ impl StackState {
 
 /// Inspect the stack pointer for evidence of a ROP stack pivot.
 ///
-/// This is a heuristic: multi-threaded programs place thread stacks in
-/// anonymous mappings, which we accept as normal. What no legitimate program
-/// does is run with its stack pointer inside the heap or inside a file-backed
-/// image, so those are the states we flag.
+/// This is a heuristic: ordinary thread stacks use anonymous mappings, which
+/// we accept as normal. Heap/file-backed stacks are flagged as potential pivots,
+/// although sigaltstack, context switching, and custom runtimes may use them
+/// legitimately. This classification does not track stack registration.
 pub fn classify_rsp(map: &MemoryMap, rsp: u64) -> StackState {
     let Some(region) = map.region_at(rsp) else {
         return StackState::Unmapped;
@@ -170,6 +166,22 @@ mod tests {
     }
 
     #[test]
+    fn named_anonymous_pages_are_not_kernel_code() {
+        for name in ["[anon:payload]", "[anon_shmem:payload]", "[unknown]"] {
+            let rx = MemoryMap::parse(&format!("1000-2000 r-xp 0 00:00 0 {name}"));
+            assert_eq!(classify_rip(&rx, 0x1100), Origin::AnonExec);
+            let wx = MemoryMap::parse(&format!("1000-2000 rwxp 0 00:00 0 {name}"));
+            assert_eq!(classify_rip(&wx, 0x1100), Origin::WxViolation);
+        }
+    }
+
+    #[test]
+    fn kernel_label_does_not_bypass_execute_permissions() {
+        let map = MemoryMap::parse("1000-2000 r--p 0 00:00 0 [vvar]");
+        assert_eq!(classify_rip(&map, 0x1100), Origin::NonExec);
+    }
+
+    #[test]
     fn legit_code_from_binary_and_libc() {
         assert_eq!(classify_rip(&m(), 0x55f000001500), Origin::LegitCode);
         assert_eq!(classify_rip(&m(), 0x7f0000000500), Origin::LegitCode);
@@ -208,12 +220,18 @@ mod tests {
 
     #[test]
     fn stack_pivot_into_heap() {
-        assert_eq!(classify_rsp(&m(), 0x55f000004000), StackState::PivotedToHeap);
+        assert_eq!(
+            classify_rsp(&m(), 0x55f000004000),
+            StackState::PivotedToHeap
+        );
     }
 
     #[test]
     fn stack_pivot_into_file() {
-        assert_eq!(classify_rsp(&m(), 0x7f0000000800), StackState::PivotedToFile);
+        assert_eq!(
+            classify_rsp(&m(), 0x7f0000000800),
+            StackState::PivotedToFile
+        );
     }
 
     #[test]

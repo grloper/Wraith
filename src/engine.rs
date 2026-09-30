@@ -39,7 +39,10 @@ struct AddrSpace {
 
 impl AddrSpace {
     fn new() -> Self {
-        AddrSpace { map: None, dirty: true }
+        AddrSpace {
+            map: None,
+            dirty: true,
+        }
     }
 }
 
@@ -201,7 +204,28 @@ impl Engine {
     /// a process shows up in the live view even before its first syscall.
     pub fn register_space(&mut self, tgid: i32) {
         self.spaces.entry(tgid).or_insert_with(AddrSpace::new);
-        self.stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
+        self.stats
+            .entry(tgid)
+            .or_insert_with(|| ProcStat::new(tgid));
+    }
+
+    /// Invalidate a shared snapshot after a memory operation completes. Entry
+    /// invalidation alone can be consumed by another thread before it runs.
+    pub fn invalidate_maps(&mut self, tgid: i32) {
+        self.spaces.entry(tgid).or_insert_with(AddrSpace::new).dirty = true;
+    }
+
+    /// Successful exec replaces the address space, so old maps and correlation
+    /// evidence no longer describe this program. Historical totals survive.
+    pub fn on_exec(&mut self, tgid: i32) {
+        self.spaces.insert(tgid, AddrSpace::new());
+        self.detector.retire(tgid);
+        let stat = self
+            .stats
+            .entry(tgid)
+            .or_insert_with(|| ProcStat::new(tgid));
+        stat.name = read_comm(tgid);
+        stat.alive = true;
     }
 
     /// Count one syscall for `tgid` against the summary and its stats row. Kept
@@ -242,6 +266,24 @@ impl Engine {
             }
         }
 
+        // A cache miss or impossible execution permission can mean another
+        // thread changed mappings outside our last snapshot. Retry once, never
+        // repeatedly spin on unavailable procfs or an inherently uncertain stop.
+        let site = entry.rip.wrapping_sub(2);
+        let retry = self
+            .spaces
+            .get(&tgid)
+            .and_then(|s| s.map.as_ref())
+            .is_some_and(|map| map.region_at(site).map_or(true, |r| !r.exec));
+        if retry {
+            if let Ok(fresh) = MemoryMap::read(pid) {
+                if let Some(space) = self.spaces.get_mut(&tgid) {
+                    space.map = Some(fresh);
+                    space.dirty = false;
+                }
+            }
+        }
+
         // Run detection against the current map, if we have one. `detector`,
         // `summary` and `stats` are disjoint fields from `spaces`, so the
         // read-only map borrow coexists with recording events.
@@ -255,7 +297,10 @@ impl Engine {
                 rsp: entry.rsp,
                 args: entry.args,
             };
-            let stat = self.stats.entry(tgid).or_insert_with(|| ProcStat::new(tgid));
+            let stat = self
+                .stats
+                .entry(tgid)
+                .or_insert_with(|| ProcStat::new(tgid));
             for ev in self.detector.on_syscall(tgid, &ctx, current) {
                 max_severity =
                     Some(max_severity.map_or(ev.severity, |cur: Severity| cur.max(ev.severity)));
@@ -286,7 +331,10 @@ impl Engine {
             Action::Proceed
         };
 
-        Step { action, event_fired: max_severity.is_some() }
+        Step {
+            action,
+            event_fired: max_severity.is_some(),
+        }
     }
 
     /// Record a backend-originated event (an enforcement action, a fatal-fault
@@ -383,6 +431,129 @@ fn read_comm(pid: i32) -> String {
 mod tests {
     use super::*;
     use crate::detect::Config;
+
+    #[test]
+    fn uncertain_map_does_not_request_enforcement() {
+        struct Sink;
+        impl Reporter for Sink {
+            fn event(&mut self, _: &Event) {}
+        }
+        let mut e = Engine::new(Config {
+            enforcement: Enforcement::Kill,
+            ..Config::default()
+        });
+        // A nonexistent pid prevents refresh, leaving a deliberately stale snapshot.
+        e.spaces.insert(
+            -1,
+            AddrSpace {
+                map: Some(MemoryMap::parse("1000-2000 r-xp 0 08:01 1 /app")),
+                dirty: false,
+            },
+        );
+        let step = e.inspect(
+            -1,
+            -1,
+            &SyscallEntry {
+                nr: 59,
+                rip: 0x3002,
+                rsp: 0,
+                args: [0; 6],
+            },
+            &mut Sink,
+        );
+        assert_eq!(step.action, Action::Proceed);
+    }
+
+    #[test]
+    fn cache_miss_refreshes_before_provenance_detection() {
+        struct Sink;
+        impl Reporter for Sink {
+            fn event(&mut self, _: &Event) {}
+        }
+        let pid = std::process::id() as i32;
+        let mut e = Engine::new(Config::default());
+        e.spaces.insert(
+            pid,
+            AddrSpace {
+                map: Some(MemoryMap::default()),
+                dirty: false,
+            },
+        );
+        let rip = Engine::new as *const () as u64;
+        let step = e.inspect(
+            pid,
+            pid,
+            &SyscallEntry {
+                nr: 1,
+                rip: rip + 2,
+                rsp: 0,
+                args: [0; 6],
+            },
+            &mut Sink,
+        );
+        assert!(
+            !step.event_fired,
+            "a real executable site must refresh a stale empty snapshot"
+        );
+        assert!(e
+            .spaces
+            .get(&pid)
+            .unwrap()
+            .map
+            .as_ref()
+            .unwrap()
+            .region_at(rip)
+            .is_some());
+    }
+
+    #[test]
+    fn exec_resets_space_and_evidence_preserving_totals() {
+        let mut e = Engine::new(Config::default());
+        e.register_space(-1);
+        e.count_syscall(-1);
+        e.spaces.get_mut(&-1).unwrap().map = Some(MemoryMap::parse("1000-2000 rwxp 0 00:00 0"));
+        e.spaces.get_mut(&-1).unwrap().dirty = false;
+        let map = e.spaces.get(&-1).unwrap().map.as_ref().unwrap().clone();
+        e.detector.on_syscall(
+            -1,
+            &SyscallCtx {
+                pid: -1,
+                nr: 0,
+                rip: 0x1100,
+                rsp: 0,
+                args: [0; 6],
+            },
+            &map,
+        );
+        e.on_exec(-1);
+        let events = e.detector.on_syscall(
+            -1,
+            &SyscallCtx {
+                pid: -1,
+                nr: 41,
+                rip: 0x1100,
+                rsp: 0,
+                args: [0; 6],
+            },
+            &map,
+        );
+        assert!(!events
+            .iter()
+            .any(|ev| ev.kind == crate::event::Kind::ExploitationChain));
+        assert!(e.spaces.get(&-1).unwrap().map.is_none());
+        assert!(e.spaces.get(&-1).unwrap().dirty);
+        assert_eq!(e.stats.get(&-1).unwrap().syscalls, 1);
+        assert_eq!(e.summary.syscalls_seen, 1);
+    }
+
+    #[test]
+    fn memory_exit_invalidates_cached_maps() {
+        let mut e = Engine::new(Config::default());
+        e.register_space(-1);
+        e.spaces.get_mut(&-1).unwrap().dirty = false;
+        e.invalidate_maps(-1);
+        assert!(e.spaces.get(&-1).unwrap().dirty);
+    }
 
     #[test]
     fn dead_process_frees_space_but_keeps_stats_row() {

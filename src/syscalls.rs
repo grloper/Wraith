@@ -43,9 +43,9 @@ pub const SENSITIVE: &[u64] = &[
     311, // process_vm_writev — cross-process injection without ptrace
     438, // pidfd_getfd — steal a file descriptor from another process
     // Spawning execution contexts.
-    56,  // clone
-    57,  // fork
-    58,  // vfork
+    56, // clone
+    57, // fork
+    58, // vfork
     // Disabling kernel defences / escaping containers.
     157, // prctl — can clear NO_NEW_PRIVS, rename, disable core dumps, etc.
     317, // seccomp
@@ -68,6 +68,7 @@ pub const SENSITIVE: &[u64] = &[
 pub const MEMORY_OPS: &[u64] = &[
     9,   // mmap
     10,  // mprotect
+    329, // pkey_mprotect
     11,  // munmap
     25,  // mremap
     12,  // brk
@@ -83,7 +84,7 @@ pub fn is_memory_op(nr: u64) -> bool {
 }
 
 pub fn is_mprotect(nr: u64) -> bool {
-    nr == 10
+    matches!(nr, 10 | 329)
 }
 
 pub fn is_mmap(nr: u64) -> bool {
@@ -155,6 +156,7 @@ pub fn name(nr: u64) -> Cow<'static, str> {
         321 => "bpf",
         322 => "execveat",
         323 => "userfaultfd",
+        329 => "pkey_mprotect",
         425 => "io_uring_setup",
         426 => "io_uring_enter",
         438 => "pidfd_getfd",
@@ -166,6 +168,13 @@ pub fn name(nr: u64) -> Cow<'static, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pkey_mprotect_tracks_mapping_and_protection_changes() {
+        assert_eq!(&*name(329), "pkey_mprotect");
+        assert!(is_mprotect(329));
+        assert!(is_memory_op(329));
+    }
 
     #[test]
     fn names_known_and_unknown() {
@@ -203,7 +212,10 @@ mod tests {
             44,  // sendto
         ] {
             assert!(is_sensitive(nr), "syscall {nr} should be sensitive");
-            assert!(!name(nr).starts_with("syscall_"), "syscall {nr} needs a name");
+            assert!(
+                !name(nr).starts_with("syscall_"),
+                "syscall {nr} needs a name"
+            );
         }
     }
 

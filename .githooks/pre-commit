@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Optional local gate; install explicitly with git config core.hooksPath .githooks.
+set -euo pipefail
+if [[ $(uname -s) != Linux ]]; then
+  echo 'Run bash scripts/verify.sh in Linux/WSL before committing.' >&2
+  exit 1
+fi
+bash scripts/verify.sh

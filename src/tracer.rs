@@ -45,11 +45,68 @@ use crate::syscalls;
 // the UI, the binary, and the test-suite — keep resolving unchanged.
 pub use crate::engine::{ProcStat, Reporter, Summary};
 
-/// Per-thread bookkeeping. `PTRACE_SYSCALL` stops at both entry and exit; each
-/// thread toggles its own phase independently since their stops interleave.
+/// The kernel identifies entry/exit stops; only in-flight map changes are local.
 struct ThreadState {
-    at_entry: bool,
+    memory_op: bool,
     tgid: i32,
+}
+
+/// Linux's ptrace_syscall_info ABI (including the largest, seccomp union arm).
+#[repr(C)]
+#[derive(Default)]
+struct SyscallInfo {
+    op: u8,
+    pad: [u8; 3],
+    arch: u32,
+    ip: u64,
+    sp: u64,
+    data: [u64; 8],
+}
+
+enum SyscallStop {
+    Entry(SyscallEntry),
+    Exit,
+}
+
+fn syscall_stop(pid: Pid) -> io::Result<SyscallStop> {
+    let mut info = SyscallInfo::default();
+    // GET_SYSCALL_INFO requires Linux >= 5.3. Never guess phase on older kernels:
+    // an attached task's first stop may be an exit, where enforcement is unsafe.
+    let size = unsafe {
+        libc::ptrace(
+            0x420e,
+            pid.as_raw(),
+            std::mem::size_of::<SyscallInfo>(),
+            &mut info as *mut SyscallInfo,
+        )
+    };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    decode_syscall_info(&info, size as i64)
+}
+
+fn decode_syscall_info(info: &SyscallInfo, size: i64) -> io::Result<SyscallStop> {
+    if info.arch != 0xc000003e {
+        return Err(io::Error::other("ptrace requires native x86-64 syscalls"));
+    }
+    if info.op == 1 && info.data[0] & 0x40000000 != 0 {
+        return Err(io::Error::other(
+            "x32 syscalls are unsupported by the native x86-64 detector",
+        ));
+    }
+    match info.op {
+        1 if size >= 80 => Ok(SyscallStop::Entry(SyscallEntry {
+            nr: info.data[0],
+            rip: info.ip,
+            rsp: info.sp,
+            args: info.data[1..7].try_into().expect("six syscall arguments"),
+        })),
+        2 if size >= 33 => Ok(SyscallStop::Exit),
+        _ => Err(io::Error::other(
+            "kernel did not identify the syscall entry/exit stop",
+        )),
+    }
 }
 
 /// Adapts a plain `FnMut(&Event)` closure into a [`Reporter`], so the common
@@ -69,7 +126,7 @@ enum Target {
     Spawned(Pid),
     /// We attached to one already-running process. We do not own it, so it is
     /// left running if we exit.
-    Attached(Pid),
+    Attached { root: Pid, threads: Vec<Pid> },
     /// We attached to a whole set of already-running processes (`scan` mode).
     /// Peers with no distinguished root; all left running if we exit.
     ScanAttached(Vec<Pid>),
@@ -79,12 +136,22 @@ pub struct Tracer {
     target: Target,
     /// The detection configuration; an [`Engine`] is built from it per run.
     cfg: Config,
+    started: bool,
 }
 
 impl Tracer {
     /// Fork, `PTRACE_TRACEME`, and exec `argv`. Returns with the child stopped
     /// at its first instruction, ready for [`Tracer::run`].
     pub fn spawn(argv: &[String], cfg: Config) -> io::Result<Self> {
+        Self::spawn_with_output(argv, cfg, false)
+    }
+
+    /// Reserve stdout for machine-readable reports by sending target output to stderr.
+    pub fn spawn_with_output(
+        argv: &[String],
+        cfg: Config,
+        redirect_stdout: bool,
+    ) -> io::Result<Self> {
         if argv.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
         }
@@ -99,6 +166,11 @@ impl Tracer {
         match unsafe { fork() }.map_err(nix_err)? {
             ForkResult::Child => {
                 // If any of this fails we cannot safely return; die immediately.
+                if redirect_stdout
+                    && unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0
+                {
+                    unsafe { libc::_exit(126) };
+                }
                 if ptrace::traceme().is_err() {
                     unsafe { libc::_exit(126) };
                 }
@@ -108,42 +180,49 @@ impl Tracer {
             }
             ForkResult::Parent { child } => {
                 // Consume the automatic stop that the exec delivers.
-                match waitpid(child, None).map_err(nix_err)? {
-                    WaitStatus::Exited(_, code) => {
+                match wait_tracee(child) {
+                    Ok(WaitStatus::Exited(_, code)) => {
                         return Err(io::Error::other(format!(
                             "target exited before trace could begin (code {code}) — command not found?"
                         )));
                     }
-                    WaitStatus::Stopped(_, _) => {}
+                    Ok(WaitStatus::Stopped(_, _)) => {}
                     other => {
+                        let _ = kill(child, Signal::SIGKILL);
+                        let _ = ptrace::cont(child, None);
+                        let _ = wait_tracee(child);
                         return Err(io::Error::other(format!(
                             "unexpected initial wait status: {other:?}"
                         )));
                     }
                 }
                 // We own this child, so tie its life to ours.
-                set_options(child, true)?;
-                Ok(Tracer { target: Target::Spawned(child), cfg })
+                if let Err(e) = set_options(child, true) {
+                    let _ = kill(child, Signal::SIGKILL);
+                    let _ = ptrace::cont(child, None);
+                    let _ = wait_tracee(child);
+                    return Err(e);
+                }
+                Ok(Tracer {
+                    target: Target::Spawned(child),
+                    cfg,
+                    started: false,
+                })
             }
         }
     }
 
     /// Attach to a running process by PID.
     pub fn attach(pid: i32, cfg: Config) -> io::Result<Self> {
-        let child = Pid::from_raw(pid);
-        ptrace::attach(child).map_err(nix_err)?;
-        // Attach delivers a SIGSTOP; wait for it.
-        match waitpid(child, None).map_err(nix_err)? {
-            WaitStatus::Stopped(_, _) => {}
-            other => {
-                return Err(io::Error::other(format!(
-                    "unexpected status after attach: {other:?}"
-                )));
-            }
-        }
-        // Observing someone else's process: leave it running if we stop.
-        set_options(child, false)?;
-        Ok(Tracer { target: Target::Attached(child), cfg })
+        let threads = attach_group(pid)?;
+        Ok(Tracer {
+            target: Target::Attached {
+                root: Pid::from_raw(read_tgid(pid)),
+                threads,
+            },
+            cfg,
+            started: false,
+        })
     }
 
     /// Attach to a whole set of already-running processes at once (`scan`
@@ -153,32 +232,24 @@ impl Tracer {
     /// whole scan. Errors only if *nothing* could be attached.
     pub fn attach_many(pids: &[i32], cfg: Config) -> io::Result<Self> {
         let mut attached = Vec::new();
+        let mut groups = std::collections::HashSet::new();
         for &pid in pids {
-            let child = Pid::from_raw(pid);
-            if ptrace::attach(child).is_err() {
-                continue; // not ours / gone / already traced
-            }
-            match waitpid(child, None) {
-                Ok(WaitStatus::Stopped(_, _)) => {}
-                _ => {
-                    let _ = ptrace::detach(child, None);
-                    continue;
+            if groups.insert(read_tgid(pid)) {
+                if let Ok(group) = attach_group(pid) {
+                    attached.extend(group);
                 }
             }
-            // Never kill-on-exit under scan: stopping the monitor must not take
-            // down every process it was watching.
-            if set_options(child, false).is_err() {
-                let _ = ptrace::detach(child, None);
-                continue;
-            }
-            attached.push(child);
         }
         if attached.is_empty() {
             return Err(io::Error::other(
                 "could not attach to any matching process (need CAP_SYS_PTRACE / ownership?)",
             ));
         }
-        Ok(Tracer { target: Target::ScanAttached(attached), cfg })
+        Ok(Tracer {
+            target: Target::ScanAttached(attached),
+            cfg,
+            started: false,
+        })
     }
 
     /// Run the trace to completion — following every thread and child the
@@ -208,17 +279,21 @@ impl Tracer {
     /// returns `-ENOSYS`, so the injected code's action never takes effect. The
     /// tracee lives on, which is what `--block` is for. Records the enforcement
     /// event through the engine on success.
-    fn block_syscall(&self, who: Pid, tgid: i32, engine: &mut Engine, reporter: &mut dyn Reporter) {
-        let Ok(mut regs) = ptrace::getregs(who) else { return };
+    fn block_syscall(
+        &self,
+        who: Pid,
+        tgid: i32,
+        engine: &mut Engine,
+        reporter: &mut dyn Reporter,
+    ) -> io::Result<()> {
+        let mut regs = ptrace::getregs(who).map_err(nix_err)?;
         let syscall = syscalls::name(regs.orig_rax);
         let rip = regs.rip.wrapping_sub(2);
         let rsp = regs.rsp;
         // -1 is not a valid syscall number; the kernel rejects it without
         // running anything and reports -ENOSYS to the tracee.
         regs.orig_rax = u64::MAX;
-        if ptrace::setregs(who, regs).is_err() {
-            return;
-        }
+        ptrace::setregs(who, regs).map_err(nix_err)?;
         let ev = Event::now(
             who.as_raw(),
             Severity::Critical,
@@ -230,6 +305,7 @@ impl Tracer {
             format!("neutralised `{syscall}` from injected code before it executed (--block)"),
         );
         engine.record_event(tgid, &ev, reporter);
+        Ok(())
     }
 
     /// `SIGKILL` every thread-group under trace. Sending the signal to a group
@@ -243,7 +319,7 @@ impl Tracer {
         threads: &HashMap<i32, ThreadState>,
         engine: &mut Engine,
         reporter: &mut dyn Reporter,
-    ) {
+    ) -> io::Result<()> {
         let (syscall, rip, rsp) = ptrace::getregs(who)
             .map(|r| (syscalls::name(r.orig_rax), r.rip.wrapping_sub(2), r.rsp))
             .unwrap_or_else(|_| (std::borrow::Cow::Borrowed("?"), 0, 0));
@@ -253,7 +329,10 @@ impl Tracer {
         let mut killed_groups = std::collections::HashSet::new();
         for ts in threads.values() {
             if killed_groups.insert(ts.tgid) {
-                let _ = kill(Pid::from_raw(ts.tgid), Signal::SIGKILL);
+                match kill(Pid::from_raw(ts.tgid), Signal::SIGKILL) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(e) => return Err(nix_err(e)),
+                }
             }
         }
 
@@ -268,6 +347,7 @@ impl Tracer {
             format!("killed traced process tree on `{syscall}` from injected code (--kill)"),
         );
         engine.record_event(tgid, &ev, reporter);
+        Ok(())
     }
 
     /// Surface a fatal memory-safety signal as a possible failed exploit.
@@ -287,7 +367,9 @@ impl Tracer {
         if !fatal {
             return false;
         }
-        let (rip, rsp) = ptrace::getregs(pid).map(|r| (r.rip, r.rsp)).unwrap_or((0, 0));
+        let (rip, rsp) = ptrace::getregs(pid)
+            .map(|r| (r.rip, r.rsp))
+            .unwrap_or((0, 0));
         let ev = Event::now(
             pid.as_raw(),
             Severity::High,
@@ -305,28 +387,86 @@ impl Tracer {
     }
 }
 
+impl Drop for Tracer {
+    fn drop(&mut self) {
+        if self.started {
+            return;
+        }
+        match &self.target {
+            Target::Spawned(pid) => {
+                let _ = kill(*pid, Signal::SIGKILL);
+                let _ = ptrace::cont(*pid, None);
+                let _ = wait_tracee(*pid);
+            }
+            Target::Attached { threads, .. } | Target::ScanAttached(threads) => {
+                for &pid in threads {
+                    release_attached(pid);
+                }
+            }
+        }
+    }
+}
+
+/// Own every traced tid, including descendants, until its final wait is reaped.
+struct TraceCleanup {
+    tids: std::collections::HashSet<Pid>,
+    owned: bool,
+    enforcement_failed: bool,
+}
+
+impl Drop for TraceCleanup {
+    fn drop(&mut self) {
+        for &pid in &self.tids {
+            if self.owned || self.enforcement_failed {
+                let _ = kill(pid, Signal::SIGKILL);
+                let _ = ptrace::cont(pid, None);
+                let _ = wait_tracee(pid);
+            } else {
+                release_attached(pid);
+            }
+        }
+    }
+}
+
 impl Backend for Tracer {
-    fn drive(self: Box<Self>, reporter: &mut dyn Reporter) -> io::Result<Summary> {
+    fn drive(mut self: Box<Self>, reporter: &mut dyn Reporter) -> io::Result<Summary> {
         let mut engine = Engine::new(self.cfg.clone());
 
         // The tracee(s) to seed, and — for a single spawned/attached target —
         // the one pid whose exit status the summary records. A `scan` has many
         // peers and no distinguished root.
         let (initial, root_pid): (Vec<Pid>, Option<i32>) = match &self.target {
-            Target::Spawned(p) | Target::Attached(p) => (vec![*p], Some(p.as_raw())),
+            Target::Spawned(p) => (vec![*p], Some(p.as_raw())),
+            Target::Attached { root, threads } => (threads.clone(), Some(root.as_raw())),
             Target::ScanAttached(pids) => (pids.clone(), None),
         };
+
+        let mut cleanup = TraceCleanup {
+            tids: initial.iter().copied().collect(),
+            owned: matches!(self.target, Target::Spawned(_)),
+            enforcement_failed: false,
+        };
+        self.started = true;
 
         // Per-thread entry/exit phase, tracked here because it is a `ptrace`
         // artifact; the shared maps and stats live in the engine.
         let mut threads: HashMap<i32, ThreadState> = HashMap::new();
         let mut last_refresh = Instant::now();
+        // Only a successfully enforced tree kill permits ESRCH while draining.
+        // Queued stops can outlive the task after SIGKILL, including other tids.
+        let mut kill_pending = false;
 
         // Seed every initial tracee and kick each toward its first syscall stop.
         for p in &initial {
             let raw = p.as_raw();
             let tgid = read_tgid(raw);
-            threads.insert(raw, ThreadState { at_entry: true, tgid });
+            threads.insert(
+                raw,
+                ThreadState {
+                    memory_op: false,
+                    tgid,
+                },
+            );
             engine.register_space(tgid);
             ptrace::syscall(*p, None).map_err(nix_err)?;
         }
@@ -334,22 +474,56 @@ impl Backend for Tracer {
 
         loop {
             // Reap any tracee. `ECHILD` means every thread and child has gone.
-            let status = match waitpid(Pid::from_raw(-1), None) {
+            let status = match wait_tracee(Pid::from_raw(-1)) {
                 Ok(s) => s,
-                Err(nix::errno::Errno::ECHILD) => break,
-                Err(e) => return Err(nix_err(e)),
+                Err(e) if e.raw_os_error() == Some(libc::ECHILD) => break,
+                Err(e) => return Err(e),
             };
 
-            let Some(who) = status_pid(&status) else { continue };
+            let Some(who) = status_pid(&status) else {
+                continue;
+            };
             let raw = who.as_raw();
+
+            if kill_pending
+                && !matches!(
+                    status,
+                    WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)
+                )
+            {
+                // A clone may have been created before enforcement but first
+                // reported afterwards. Kill late tracees as well as known tids.
+                if cleanup.tids.insert(who) {
+                    match kill(who, Signal::SIGKILL) {
+                        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                        Err(e) => return Err(nix_err(e)),
+                    }
+                }
+                match ptrace::cont(who, None) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(e) => return Err(nix_err(e)),
+                }
+                continue;
+            }
 
             // First sighting of a tid: a freshly-cloned thread or child, still
             // stopped at its creation stop with our trace options inherited.
             // Registering lazily on first sight (rather than parsing the parent
             // clone event) sidesteps the parent/child wait-ordering race.
             if let Entry::Vacant(slot) = threads.entry(raw) {
+                if matches!(
+                    status,
+                    WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)
+                ) {
+                    cleanup.tids.remove(&who);
+                    continue;
+                }
+                cleanup.tids.insert(who);
                 let tgid = read_tgid(raw);
-                slot.insert(ThreadState { at_entry: true, tgid });
+                slot.insert(ThreadState {
+                    memory_op: false,
+                    tgid,
+                });
                 engine.register_space(tgid);
                 // Consume this initial stop and let the new tracee run; the
                 // creation SIGSTOP must not be forwarded.
@@ -362,24 +536,26 @@ impl Backend for Tracer {
                 WaitStatus::Exited(_, code) => {
                     let tgid = threads.get(&raw).map(|t| t.tgid);
                     threads.remove(&raw);
+                    cleanup.tids.remove(&who);
                     if Some(raw) == root_pid {
                         engine.set_exit_code(code);
                     }
                     mark_dead_if_last(&mut engine, &threads, tgid);
                     engine.refresh(reporter, &mut last_refresh, true);
-                    if threads.is_empty() {
+                    if threads.is_empty() && !kill_pending {
                         break;
                     }
                 }
                 WaitStatus::Signaled(_, sig, _) => {
                     let tgid = threads.get(&raw).map(|t| t.tgid);
                     threads.remove(&raw);
+                    cleanup.tids.remove(&who);
                     if Some(raw) == root_pid {
                         engine.set_term_signal(sig as i32);
                     }
                     mark_dead_if_last(&mut engine, &threads, tgid);
                     engine.refresh(reporter, &mut last_refresh, true);
-                    if threads.is_empty() {
+                    if threads.is_empty() && !kill_pending {
                         break;
                     }
                 }
@@ -388,8 +564,8 @@ impl Backend for Tracer {
                     // still, read it fallibly rather than index-and-panic, so a
                     // phantom stop from a kernel/wait race can never crash the
                     // sensor. An unattributable stop is simply resumed.
-                    let (at_entry, tgid) = match threads.get(&raw) {
-                        Some(ts) => (ts.at_entry, ts.tgid),
+                    let tgid = match threads.get(&raw) {
+                        Some(ts) => ts.tgid,
                         None => {
                             let _ = ptrace::syscall(who, None);
                             continue;
@@ -397,34 +573,47 @@ impl Backend for Tracer {
                     };
                     let mut killed = false;
                     let mut event_fired = false;
-                    if at_entry {
-                        // Count the syscall first, so a lost `getregs` still
-                        // registers as work the tracee did, then inspect it.
-                        engine.count_syscall(tgid);
-                        if let Ok(regs) = ptrace::getregs(who) {
-                            let entry = SyscallEntry {
-                                nr: regs.orig_rax,
-                                rip: regs.rip,
-                                rsp: regs.rsp,
-                                args: [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9],
-                            };
+                    match syscall_stop(who)? {
+                        SyscallStop::Entry(entry) => {
+                            engine.count_syscall(tgid);
+                            if let Some(ts) = threads.get_mut(&raw) {
+                                ts.memory_op = syscalls::is_memory_op(entry.nr);
+                            }
                             let step = engine.inspect(raw, tgid, &entry, reporter);
                             event_fired = step.event_fired;
                             // Enforce at the entry stop — the one moment the
                             // offending syscall has not yet run. The mechanism is
                             // ours; the engine already decided the policy.
                             match step.action {
-                                Action::Block => self.block_syscall(who, tgid, &mut engine, reporter),
+                                Action::Block => {
+                                    if let Err(e) =
+                                        self.block_syscall(who, tgid, &mut engine, reporter)
+                                    {
+                                        cleanup.enforcement_failed = true;
+                                        return Err(e);
+                                    }
+                                }
                                 Action::Kill => {
-                                    self.kill_tree(who, tgid, &threads, &mut engine, reporter);
+                                    if let Err(e) =
+                                        self.kill_tree(who, tgid, &threads, &mut engine, reporter)
+                                    {
+                                        cleanup.enforcement_failed = true;
+                                        return Err(e);
+                                    }
                                     killed = true;
+                                    kill_pending = true;
                                 }
                                 Action::Proceed => {}
                             }
                         }
-                    }
-                    if let Some(ts) = threads.get_mut(&raw) {
-                        ts.at_entry = !ts.at_entry;
+                        SyscallStop::Exit => {
+                            if let Some(ts) = threads.get_mut(&raw) {
+                                if ts.memory_op {
+                                    engine.invalidate_maps(tgid);
+                                }
+                                ts.memory_op = false;
+                            }
+                        }
                     }
                     // Resume. After a kill the tracee is stopped with a pending
                     // SIGKILL; restarting it lets the kernel deliver it, and the
@@ -439,6 +628,21 @@ impl Backend for Tracer {
                     engine.refresh(reporter, &mut last_refresh, event_fired);
                 }
                 WaitStatus::Stopped(_, sig) => {
+                    // Legacy TRACEME cannot LISTEN without restarting a group
+                    // stop. Refuse this unsupported path rather than silently
+                    // letting the target run without SIGCONT. Owned cleanup
+                    // terminates/reaps the child on the operational error.
+                    if cleanup.owned
+                        && matches!(
+                            sig,
+                            Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+                        )
+                        && matches!(ptrace::getsiginfo(who), Err(nix::errno::Errno::EINVAL))
+                    {
+                        return Err(io::Error::other(
+                            "job-control group stops are unsupported for launched targets; use a validated attach workflow",
+                        ));
+                    }
                     // A real signal was delivered to the tracee (not a syscall
                     // stop). Fatal memory-safety signals are worth surfacing as
                     // a possible failed exploit, then we forward the signal.
@@ -451,9 +655,40 @@ impl Backend for Tracer {
                     ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
                     engine.refresh(reporter, &mut last_refresh, fired);
                 }
-                WaitStatus::PtraceEvent(_, _, _) => {
-                    // Clone/fork/exec notification for a tracee we already know;
-                    // the new child is handled on its own first sighting above.
+                WaitStatus::PtraceEvent(_, sig, event) => {
+                    if !cleanup.owned
+                        && event == libc::PTRACE_EVENT_STOP
+                        && matches!(
+                            sig,
+                            Signal::SIGSTOP | Signal::SIGTSTP | Signal::SIGTTIN | Signal::SIGTTOU
+                        )
+                    {
+                        let result = unsafe { libc::ptrace(libc::PTRACE_LISTEN, raw, 0, 0) };
+                        if result < 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        continue;
+                    }
+                    if event == libc::PTRACE_EVENT_EXEC {
+                        // Non-leader exec changes its tid to the group leader's;
+                        // the former tid and all sibling threads cease to exist.
+                        let former = ptrace::getevent(who).map_err(nix_err)? as i32;
+                        let tgid = read_tgid(raw);
+                        threads.remove(&former);
+                        threads.retain(|tid, ts| *tid == raw || ts.tgid != tgid);
+                        cleanup
+                            .tids
+                            .retain(|pid| threads.contains_key(&pid.as_raw()));
+                        cleanup.tids.insert(who);
+                        threads.insert(
+                            raw,
+                            ThreadState {
+                                memory_op: false,
+                                tgid,
+                            },
+                        );
+                        engine.on_exec(tgid);
+                    }
                     ptrace::syscall(who, None).map_err(nix_err)?;
                 }
                 WaitStatus::Continued(_) => {}
@@ -475,7 +710,8 @@ fn set_options(pid: Pid, kill_on_exit: bool) -> io::Result<()> {
     let mut opts = Options::PTRACE_O_TRACESYSGOOD
         | Options::PTRACE_O_TRACECLONE
         | Options::PTRACE_O_TRACEFORK
-        | Options::PTRACE_O_TRACEVFORK;
+        | Options::PTRACE_O_TRACEVFORK
+        | Options::PTRACE_O_TRACEEXEC;
     // EXITKILL ties the tracee's life to ours — right for a process we spawned
     // and own, but wrong when merely observing someone else's process (attach /
     // scan): stopping the monitor must not kill what it was watching.
@@ -483,6 +719,95 @@ fn set_options(pid: Pid, kill_on_exit: bool) -> io::Result<()> {
         opts |= Options::PTRACE_O_EXITKILL;
     }
     ptrace::setoptions(pid, opts).map_err(nix_err)
+}
+
+/// Freeze an entire existing thread group before enabling clone following.
+/// Once all enumerated tids are stopped, a stable pass closes the creation race.
+fn attach_group(pid: i32) -> io::Result<Vec<Pid>> {
+    let tgid = read_tgid(pid);
+    let mut attached = Vec::new();
+    let result = (|| {
+        for _ in 0..8 {
+            let mut added = false;
+            for entry in std::fs::read_dir(format!("/proc/{tgid}/task"))? {
+                let tid: i32 = entry?
+                    .file_name()
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| io::Error::other("invalid task id"))?;
+                let task = Pid::from_raw(tid);
+                if attached.contains(&task) {
+                    continue;
+                }
+                if attached.len() >= 4096 {
+                    return Err(io::Error::other(
+                        "thread group exceeds attachment limit (4096)",
+                    ));
+                }
+                match ptrace::seize(task, ptrace::Options::empty()) {
+                    Ok(()) => {}
+                    Err(nix::errno::Errno::ESRCH) => continue,
+                    Err(e) => return Err(nix_err(e)),
+                }
+                attached.push(task);
+                ptrace::interrupt(task).map_err(nix_err)?;
+                match wait_tracee(task)? {
+                    WaitStatus::PtraceEvent(_, _, _) | WaitStatus::Stopped(_, _) => {}
+                    WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => {
+                        attached.pop();
+                        continue;
+                    }
+                    status => {
+                        return Err(io::Error::other(format!(
+                            "unexpected attach stop: {status:?}"
+                        )))
+                    }
+                }
+                added = true;
+            }
+            if !added {
+                if attached.is_empty() {
+                    return Err(io::Error::other("thread group exited during attach"));
+                }
+                for &task in &attached {
+                    set_options(task, false)?;
+                }
+                return Ok(());
+            }
+        }
+        Err(io::Error::other(
+            "thread group did not stabilize within 8 attachment passes",
+        ))
+    })();
+    if let Err(e) = result {
+        for task in &attached {
+            release_attached(*task);
+        }
+        return Err(e);
+    }
+    Ok(attached)
+}
+
+fn wait_tracee(pid: Pid) -> io::Result<WaitStatus> {
+    loop {
+        match waitpid(pid, Some(nix::sys::wait::WaitPidFlag::__WALL)) {
+            Err(nix::errno::Errno::EINTR) => continue,
+            result => return result.map_err(nix_err),
+        }
+    }
+}
+
+fn release_attached(pid: Pid) {
+    // INTERRUPT on an already stopped task may queue a future event instead of
+    // generating a waitable stop, so detach a stopped task directly first.
+    if ptrace::detach(pid, None).is_ok() {
+        return;
+    }
+    // SEIZE permits a signal-free stop for cleanup, even from LISTEN state.
+    if ptrace::interrupt(pid).is_ok() {
+        let _ = wait_tracee(pid);
+        let _ = ptrace::detach(pid, None);
+    }
 }
 
 /// The pid a [`WaitStatus`] refers to, if it carries one.
@@ -511,4 +836,42 @@ fn mark_dead_if_last(engine: &mut Engine, threads: &HashMap<i32, ThreadState>, t
 
 fn nix_err(e: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syscall_info_rejects_x32_despite_native_audit_arch() {
+        let mut info = SyscallInfo {
+            op: 1,
+            arch: 0xc000003e,
+            ..Default::default()
+        };
+        info.data[0] = 0x40000000 | 41;
+        assert!(decode_syscall_info(&info, 80).is_err());
+    }
+
+    #[test]
+    fn syscall_info_distinguishes_entry_exit_and_rejects_short_records() {
+        let mut info = SyscallInfo {
+            op: 1,
+            arch: 0xc000003e,
+            ..Default::default()
+        };
+        assert!(matches!(
+            decode_syscall_info(&info, 80),
+            Ok(SyscallStop::Entry(_))
+        ));
+        assert!(decode_syscall_info(&info, 79).is_err());
+        info.op = 2;
+        assert!(matches!(
+            decode_syscall_info(&info, 33),
+            Ok(SyscallStop::Exit)
+        ));
+        assert!(decode_syscall_info(&info, 32).is_err());
+        info.arch = 0x40000003;
+        assert!(decode_syscall_info(&info, 33).is_err());
+    }
 }

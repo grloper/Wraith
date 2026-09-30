@@ -137,9 +137,9 @@ impl Event {
         let tag = self.severity.as_str();
         let painted = if color {
             let code = match self.severity {
-                Severity::Info => "36",     // cyan
-                Severity::Warn => "33",     // yellow
-                Severity::High => "35",     // magenta
+                Severity::Info => "36",       // cyan
+                Severity::Warn => "33",       // yellow
+                Severity::High => "35",       // magenta
                 Severity::Critical => "1;31", // bold red
             };
             format!("\x1b[{code}m{tag:>8}\x1b[0m")
@@ -220,7 +220,16 @@ mod tests {
 
     #[test]
     fn line_contains_key_fields() {
-        let e = Event::now(7, Severity::High, Kind::WxViolation, "mprotect", 0x1000, 0x2000, "anon", "rwx requested");
+        let e = Event::now(
+            7,
+            Severity::High,
+            Kind::WxViolation,
+            "mprotect",
+            0x1000,
+            0x2000,
+            "anon",
+            "rwx requested",
+        );
         let l = e.to_line(false);
         assert!(l.contains("pid=7"));
         assert!(l.contains("wx_violation"));
@@ -241,11 +250,23 @@ mod tests {
         // A mapped-file label carrying an escape sequence must not reach the TTY
         // as a live escape — the raw clear-screen bytes are gone from the line.
         let e = Event::now(
-            1, Severity::High, Kind::ForeignOriginSyscall, "execve",
-            0x1000, 0x2000, "eviltool\x1b[2J\x1b[H", "injected code is now acting",
+            1,
+            Severity::High,
+            Kind::ForeignOriginSyscall,
+            "execve",
+            0x1000,
+            0x2000,
+            "eviltool\x1b[2J\x1b[H",
+            "injected code is now acting",
         );
         let l = e.to_line(false);
-        assert!(!l.contains('\x1b'), "escape from origin must be stripped: {l:?}");
-        assert!(l.contains("eviltool"), "sanitised label text should remain: {l:?}");
+        assert!(
+            !l.contains('\x1b'),
+            "escape from origin must be stripped: {l:?}"
+        );
+        assert!(
+            l.contains("eviltool"),
+            "sanitised label text should remain: {l:?}"
+        );
     }
 }

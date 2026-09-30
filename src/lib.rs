@@ -3,33 +3,17 @@
 //! Signature-free runtime exploitation detection via **syscall provenance
 //! verification**.
 //!
-//! Most defensive tooling answers one of two questions: *does this program
-//! contain a known vulnerability?* (needs the bug) or *does this file match
-//! known-bad bytes?* (needs the payload). Wraith answers a third, harder one:
-//! *is this process being exploited right now?* — without knowing the bug or
-//! the payload in advance.
+//! Wraith inspects syscall instruction origins, executable-memory protection
+//! requests and stack placement for a selected Linux process tree. Its rules
+//! are behavioral heuristics, not payload signatures or proof of malicious intent.
 //!
-//! The insight is that every memory-corruption exploit, whatever the root
-//! cause, converges on the same observable behaviour: to accomplish anything
-//! the attacker must eventually issue system calls, and at that moment the
-//! process is in a state legitimate execution never produces. Wraith attaches
-//! to a process with `ptrace`, stops at the entry of every syscall, and checks
-//! a handful of invariants that hold for all benign programs:
+//! Anonymous RX code can be legitimate JIT code, W->X transitions can enforce
+//! W^X, and alternate stacks can live on the heap. The default policy accounts
+//! for anonymous RX origins; operators must baseline other workload-specific
+//! behavior before enabling enforcement. ROP in accepted code, data-only attacks
+//! and modified file-backed executable pages can evade provenance checks.
 //!
-//! 1. **Provenance** — a syscall instruction only ever executes from a
-//!    file-backed executable page (the program's own code, a shared library,
-//!    or the kernel vDSO). Injected shellcode in the heap, stack, or an
-//!    anonymous page breaks this. See [`provenance`].
-//! 2. **W^X** — no benign program needs a page that is writable *and*
-//!    executable, nor to flip a writable page to executable. Payload staging
-//!    breaks this. See [`detect`].
-//! 3. **Stack integrity** — at syscall time the stack pointer is inside a real
-//!    stack, never the heap or a file image. ROP stack pivots break this.
-//!
-//! Because these are invariants of *legitimate behaviour* rather than
-//! signatures of *specific attacks*, a violation is evidence of exploitation
-//! regardless of which vulnerability (zero-day or n-day) was used to get
-//! there.
+//! See the repository threat model for coverage and deployment limits.
 //!
 //! ## Layout
 //! - [`maps`] — parse `/proc/<pid>/maps`.
@@ -45,7 +29,7 @@
 // (`orig_rax`, `rip`, `rsp`, `rdi`…) and keys off x86-64 syscall numbers. Those
 // are architecture-specific, so refuse to build anywhere else with a clear
 // message rather than failing deep inside the tracer with a missing-field error.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 compile_error!(
     "Wraith currently supports x86-64 Linux only: its syscall table and register \
      decoding are x86-64-specific. Build on an x86-64 host."

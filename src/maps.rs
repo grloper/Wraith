@@ -135,12 +135,7 @@ fn parse_perms(field: &str) -> Option<(bool, bool, bool, bool)> {
     if b.len() < 4 {
         return None;
     }
-    Some((
-        b[0] == b'r',
-        b[1] == b'w',
-        b[2] == b'x',
-        b[3] == b's',
-    ))
+    Some((b[0] == b'r', b[1] == b'w', b[2] == b'x', b[3] == b's'))
 }
 
 fn classify(path: &str) -> RegionKind {
@@ -151,26 +146,35 @@ fn classify(path: &str) -> RegionKind {
         "[vdso]" | "[vvar]" | "[vsyscall]" | "[vvar_vclock]" => RegionKind::Kernel,
         // Per-thread stacks appear as `[stack:tid]` on older kernels.
         p if p.starts_with("[stack") => RegionKind::Stack,
-        // Any other bracketed pseudo-file is kernel-managed.
-        p if p.starts_with('[') => RegionKind::Kernel,
+        // PR_SET_VMA names user-controlled anonymous mappings as [anon:*] or
+        // [anon_shmem:*]. Unknown pseudo-names confer no kernel-code trust.
+        p if p.starts_with('[') => RegionKind::Anonymous,
         p => RegionKind::File(p.to_string()),
     }
 }
 
+fn take_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    *rest = rest.trim_start();
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    let field = &rest[..end];
+    *rest = &rest[end..];
+    Some(field)
+}
+
 fn parse_line(line: &str) -> Option<Region> {
     // Format: START-END PERMS OFFSET DEV INODE [PATHNAME]
-    let mut it = line.split_whitespace();
-    let range = it.next()?;
-    let perms = it.next()?;
-    let _offset = it.next()?;
-    let _dev = it.next()?;
-    let _inode = it.next()?;
-    // Pathname may contain spaces; take the remainder of the line.
-    let path = line
-        .splitn(6, char::is_whitespace)
-        .nth(5)
-        .map(str::trim)
-        .unwrap_or("");
+    let mut rest = line;
+    let range = take_field(&mut rest)?;
+    let perms = take_field(&mut rest)?;
+    let _offset = take_field(&mut rest)?;
+    let _dev = take_field(&mut rest)?;
+    let _inode = take_field(&mut rest)?;
+    // Consume five fields, not five whitespace characters. Preserve internal
+    // spaces in the pathname even when preceding fields are padded or tabbed.
+    let path = rest.trim();
 
     let (start_s, end_s) = range.split_once('-')?;
     let start = u64::from_str_radix(start_s, 16).ok()?;
@@ -206,6 +210,22 @@ mod tests {
 7ffde13a0000-7ffde13a4000 r-xp 00000000 00:00 0          [vdso]";
 
     #[test]
+    fn padded_and_tabbed_fields_preserve_pathname() {
+        let m = MemoryMap::parse("  1000-2000\t r-xp  00000000\t00:00   0\t[anon:jit]\n3000-4000  r-xp\t0  08:01\t1   /tmp/code with spaces.so");
+        assert_eq!(m.region_at(0x1100).unwrap().kind, RegionKind::Anonymous);
+        assert_eq!(
+            m.region_at(0x3100).unwrap().kind,
+            RegionKind::File("/tmp/code with spaces.so".into())
+        );
+    }
+
+    #[test]
+    fn padded_fields_without_path_remain_anonymous() {
+        let m = MemoryMap::parse("1000-2000   r-xp\t 0  00:00  0");
+        assert_eq!(m.region_at(0x1100).unwrap().kind, RegionKind::Anonymous);
+    }
+
+    #[test]
     fn parses_all_regions() {
         let m = MemoryMap::parse(SAMPLE);
         assert_eq!(m.regions().len(), 6);
@@ -214,10 +234,16 @@ mod tests {
     #[test]
     fn classifies_kinds() {
         let m = MemoryMap::parse(SAMPLE);
-        assert!(matches!(m.region_at(0x55f0aa3b1500).unwrap().kind, RegionKind::File(_)));
+        assert!(matches!(
+            m.region_at(0x55f0aa3b1500).unwrap().kind,
+            RegionKind::File(_)
+        ));
         assert_eq!(m.region_at(0x55f0aa3d0100).unwrap().kind, RegionKind::Heap);
         assert_eq!(m.region_at(0x7ffde1200500).unwrap().kind, RegionKind::Stack);
-        assert_eq!(m.region_at(0x7ffde13a0100).unwrap().kind, RegionKind::Kernel);
+        assert_eq!(
+            m.region_at(0x7ffde13a0100).unwrap().kind,
+            RegionKind::Kernel
+        );
     }
 
     #[test]

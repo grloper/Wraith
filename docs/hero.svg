@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+<title id="title">Wraith — inspect the origin, not the payload</title><desc id="desc">Linux syscall provenance sensor built in Rust. Observe, explain, and optionally enforce.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#07111e"/><stop offset="1" stop-color="#14263a"/></linearGradient><pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse"><path d="M40 0H0V40" fill="none" stroke="#5eead4" stroke-opacity=".07"/></pattern></defs>
+<rect width="1200" height="360" rx="24" fill="url(#bg)"/><rect width="1200" height="360" rx="24" fill="url(#grid)"/>
+<path d="M88 105L148 76L208 105V168Q208 220 148 248Q88 220 88 168Z" fill="#5eead4" fill-opacity=".08" stroke="#5eead4" stroke-width="3"/><path d="M119 166L139 186L178 137" fill="none" stroke="#5eead4" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="260" y="139" font-family="system-ui,sans-serif" font-size="64" font-weight="750" letter-spacing="8" fill="#f1f5f9">WRAITH</text>
+<text x="262" y="184" font-family="system-ui,sans-serif" font-size="24" fill="#cbd5e1">Inspect the origin. Not the payload.</text>
+<text x="262" y="227" font-family="monospace" font-size="17" fill="#5eead4">LINUX x86-64 / RUST / SYSCALL PROVENANCE</text>
+<path d="M872 105H1100M872 152H1100M872 199H1100M872 246H1100" stroke="#334155"/><text x="872" y="95" font-family="monospace" font-size="15" fill="#94a3b8">01  CAPTURE</text><text x="872" y="142" font-family="monospace" font-size="15" fill="#94a3b8">02  CLASSIFY</text><text x="872" y="189" font-family="monospace" font-size="15" fill="#94a3b8">03  CORRELATE</text><text x="872" y="236" font-family="monospace" font-size="15" fill="#5eead4">04  EXPLAIN</text>
+<text x="60" y="317" font-family="monospace" font-size="14" fill="#94a3b8">OBSERVE BY DEFAULT · SMALL SUPPLY CHAIN · REPRODUCIBLE LOCAL DEMOS</text></svg>

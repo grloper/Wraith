@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="946" viewBox="0 0 1120 946" role="img" aria-labelledby="title desc">
+<title id="title">Wraith: recorded local provenance demo</title>
+<desc id="desc">Actual Linux fixture output: benign control, injected syscall detection, and block enforcement. Paths abbreviated; PIDs, addresses and counts vary by run.</desc>
+<rect width="1120" height="946" rx="18" fill="#0c1220"/>
+<circle cx="28" cy="28" r="5" fill="#fb7185"/><circle cx="48" cy="28" r="5" fill="#fbbf24"/><circle cx="68" cy="28" r="5" fill="#34d399"/>
+<text x="92" y="34" fill="#94a3b8" font-family="monospace" font-size="14">WRAITH / recorded fixture session / Linux x86-64</text>
+<text x="24" y="76" fill="#5eead4" font-family="monospace" font-size="14">$ wraith run -- benign</text>
+<text x="24" y="96" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: monitoring `benign` (provenance mode)</text>
+<text x="24" y="116" fill="#cbd5e1" font-family="monospace" font-size="14">benign: starting normal work</text>
+<text x="24" y="136" fill="#cbd5e1" font-family="monospace" font-size="14">benign: read 1162 bytes from /proc/self/status</text>
+<text x="24" y="156" fill="#cbd5e1" font-family="monospace" font-size="14">benign: opened and closed a socket from legitimate code</text>
+<text x="24" y="176" fill="#cbd5e1" font-family="monospace" font-size="14">benign: done (0xb82fc798287677b0)</text>
+<text x="24" y="196" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: 80 syscalls, 0 event(s); verdict: clean</text>
+<text x="24" y="216" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: target exit: 0</text>
+<text x="24" y="236" fill="#cbd5e1" font-family="monospace" font-size="14">sensor exit: 0</text>
+<text x="24" y="256" fill="#cbd5e1" font-family="monospace" font-size="14"></text>
+<text x="24" y="276" fill="#5eead4" font-family="monospace" font-size="14">$ wraith run -- shellcode-sim</text>
+<text x="24" y="296" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: monitoring `shellcode-sim` (provenance mode)</text>
+<text x="24" y="316" fill="#cbd5e1" font-family="monospace" font-size="14">    HIGH pid=2314 wx_violation             mmap @ 0x7f07e11eb5ea [0x0]  `mmap` requests writable+executabl</text>
+<text x="24" y="336" fill="#cbd5e1" font-family="monospace" font-size="14">e memory — classic shellcode staging</text>
+<text x="24" y="356" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: staged RWX page at 0x7f07e130b000</text>
+<text x="24" y="376" fill="#fda4af" font-family="monospace" font-size="14">CRITICAL pid=2314 foreign_origin_syscall   socket @ 0x7f07e130b011 [anon]  sensitive syscall `socket` issu</text>
+<text x="24" y="396" fill="#cbd5e1" font-family="monospace" font-size="14">ed from wx-violation memory — possible injected code activity</text>
+<text x="24" y="416" fill="#fda4af" font-family="monospace" font-size="14">CRITICAL pid=2314 exploitation_chain       socket @ 0x7f07e130b011 [correlated]  EXPLOITATION CHAIN: execu</text>
+<text x="24" y="436" fill="#cbd5e1" font-family="monospace" font-size="14">table-memory staging request observed (W^X) -&gt; sensitive syscall from anomalous executable memory</text>
+<text x="24" y="456" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: payload ran from injected page; socket() -&gt; 3</text>
+<text x="24" y="476" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: done</text>
+<text x="24" y="496" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: 69 syscalls, 3 event(s); verdict: EXPLOITATION DETECTED</text>
+<text x="24" y="516" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: target exit: 0</text>
+<text x="24" y="536" fill="#cbd5e1" font-family="monospace" font-size="14">sensor exit: 3</text>
+<text x="24" y="556" fill="#cbd5e1" font-family="monospace" font-size="14"></text>
+<text x="24" y="576" fill="#5eead4" font-family="monospace" font-size="14">$ wraith run --block -- shellcode-sim</text>
+<text x="24" y="596" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: monitoring `shellcode-sim` (provenance mode) [enforcing: block]</text>
+<text x="24" y="616" fill="#cbd5e1" font-family="monospace" font-size="14">    HIGH pid=2316 wx_violation             mmap @ 0x7fed66aa95ea [0x0]  `mmap` requests writable+executabl</text>
+<text x="24" y="636" fill="#cbd5e1" font-family="monospace" font-size="14">e memory — classic shellcode staging</text>
+<text x="24" y="656" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: staged RWX page at 0x7fed66bc9000</text>
+<text x="24" y="676" fill="#fda4af" font-family="monospace" font-size="14">CRITICAL pid=2316 foreign_origin_syscall   socket @ 0x7fed66bc9011 [anon]  sensitive syscall `socket` issu</text>
+<text x="24" y="696" fill="#cbd5e1" font-family="monospace" font-size="14">ed from wx-violation memory — possible injected code activity</text>
+<text x="24" y="716" fill="#fda4af" font-family="monospace" font-size="14">CRITICAL pid=2316 exploitation_chain       socket @ 0x7fed66bc9011 [correlated]  EXPLOITATION CHAIN: execu</text>
+<text x="24" y="736" fill="#cbd5e1" font-family="monospace" font-size="14">table-memory staging request observed (W^X) -&gt; sensitive syscall from anomalous executable memory</text>
+<text x="24" y="756" fill="#fda4af" font-family="monospace" font-size="14">CRITICAL pid=2316 blocked                  socket @ 0x7fed66bc9011 [enforced]  neutralised `socket` from i</text>
+<text x="24" y="776" fill="#cbd5e1" font-family="monospace" font-size="14">njected code before it executed (--block)</text>
+<text x="24" y="796" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: payload ran from injected page; socket() -&gt; -38</text>
+<text x="24" y="816" fill="#cbd5e1" font-family="monospace" font-size="14">shellcode-sim: done</text>
+<text x="24" y="836" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: 68 syscalls, 4 event(s); verdict: EXPLOITATION DETECTED</text>
+<text x="24" y="856" fill="#cbd5e1" font-family="monospace" font-size="14">wraith: target exit: 0</text>
+<text x="24" y="876" fill="#cbd5e1" font-family="monospace" font-size="14">sensor exit: 3</text>
+<text x="24" y="896" fill="#cbd5e1" font-family="monospace" font-size="14"></text>
+</svg>

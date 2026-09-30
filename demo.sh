@@ -1,79 +1,51 @@
 #!/usr/bin/env bash
-# Side-by-side demonstration: Wraith stays silent on a benign program and
-# catches the payload simulator executing a syscall from injected memory.
+# Local fixtures only. Fail if a verdict or enforcement behavior regresses.
 set -euo pipefail
-
 cd "$(dirname "$0")"
-
-echo "==> building (release)"
-cargo build --release --quiet
-
-WRAITH=./target/release/wraith
-BENIGN=./target/release/benign
-SIM=./target/release/shellcode-sim
-MT_BENIGN=./target/release/benign-threads
-MT_SIM=./target/release/mt-shellcode-sim
-
-echo
-echo "============================================================"
-echo " 1/4  BENIGN target — expect: clean, exit 0"
-echo "============================================================"
-set +e
-"$WRAITH" run --min info -- "$BENIGN"
-echo "   -> wraith exit code: $?"
-set -e
-
-echo
-echo "============================================================"
-echo " 2/4  SHELLCODE-SIM target — expect: EXPLOITATION DETECTED, exit 3"
-echo "============================================================"
-set +e
-"$WRAITH" run -- "$SIM"
-code=$?
-echo "   -> wraith exit code: $code"
-set -e
-
-echo
-echo "============================================================"
-echo " 3/4  BENIGN multithreaded target — expect: clean, exit 0"
-echo "============================================================"
-set +e
-"$WRAITH" run -- "$MT_BENIGN"
-echo "   -> wraith exit code: $?"
-set -e
-
-echo
-echo "============================================================"
-echo " 4/4  WORKER-THREAD exploit — payload fires from a spawned"
-echo "      thread; only thread-following catches it (exit 3)"
-echo "============================================================"
-set +e
-"$WRAITH" run -- "$MT_SIM"
-mt_code=$?
-echo "   -> wraith exit code: $mt_code"
-set -e
-
-echo
-echo "============================================================"
-echo " 5/5  ENFORCEMENT — same payload, but Wraith intervenes"
-echo "============================================================"
-echo "--- --block: the injected socket() is neutralised (returns -ENOSYS),"
-echo "    the process survives so you can watch what it does next ---"
-set +e
-"$WRAITH" run --block -- "$SIM"
-echo "   -> wraith exit code: $?"
-echo
-echo "--- --kill: the traced tree is SIGKILLed before the payload runs ---"
-"$WRAITH" run --kill -- "$SIM"
-echo "   -> wraith exit code: $?"
-set -e
-
-echo
-if [ "$code" -eq 3 ] && [ "$mt_code" -eq 3 ]; then
-  echo "Demo OK: benign runs (single- and multi-threaded) were clean;"
-  echo "         injected-code execution was detected on the main thread AND"
-  echo "         on a worker thread, correlated into an exploitation chain, and"
-  echo "         (in --block/--kill) stopped before the payload's syscall ran."
-else
-  echo "Demo WARNING: expected exit 3 from both simulator runs (got $code and $mt_code)."
+if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
+  echo 'Wraith demos require x86-64 Linux.' >&2
+  exit 2
 fi
+cargo build --release --locked --quiet
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+wraith=./target/release/wraith
+run_case() {
+  local label=$1 expected=$2 target=$3 mode=${4:-}
+  local code=0
+  echo
+  printf '==> %s (expected sensor exit %s)\n' "$label" "$expected"
+  local flags=()
+  [[ -z $mode ]] || flags+=("$mode")
+  "$wraith" run "${flags[@]}" --json "$out/$label.jsonl" -- "./target/release/$target" >"$out/$label.stdout" 2>"$out/$label.stderr" || code=$?
+  cat "$out/$label.stdout" "$out/$label.stderr"
+  if [[ $code != "$expected" ]]; then
+    printf 'FAIL: %s exited %s, expected %s\n' "$label" "$code" "$expected" >&2
+    exit 1
+  fi
+}
+run_case benign 0 benign
+run_case benign-threads 0 benign-threads
+run_case injected 3 shellcode-sim
+run_case injected-worker 3 mt-shellcode-sim
+run_case block 3 shellcode-sim --block
+run_case kill 3 shellcode-sim --kill
+python3 - "$out" <<'PY'
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+for name in ('benign', 'benign-threads'):
+    assert not (root / f'{name}.jsonl').read_text(), f'{name}: unexpected detections'
+for name in ('injected', 'injected-worker', 'block', 'kill'):
+    events = [json.loads(line) for line in (root / f'{name}.jsonl').read_text().splitlines()]
+    assert any(e['kind'] == 'foreign_origin_syscall' and e['severity'] == 'CRITICAL' for e in events), name
+    assert any(e['kind'] == 'exploitation_chain' for e in events), name
+blocked = (root / 'block.stdout').read_text()
+assert 'socket() -> -38' in blocked, 'blocked syscall did not return ENOSYS'
+assert 'shellcode-sim: done' in blocked, 'block must let fixture finish'
+assert any(json.loads(line)['kind'] == 'blocked' for line in (root / 'block.jsonl').read_text().splitlines())
+assert any(json.loads(line)['kind'] == 'killed' for line in (root / 'kill.jsonl').read_text().splitlines())
+assert 'payload ran' not in (root / 'kill.stdout').read_text(), 'killed payload executed'
+print('\nPASS: both controls clean; main/worker injection detected; block and kill verified.')
+PY

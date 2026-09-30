@@ -25,9 +25,10 @@ const PAYLOAD: [u8; 19] = [
     0xbe, 0x01, 0x00, 0x00, 0x00, // mov esi, 1
     0x31, 0xd2, // xor edx, edx
     0xb8, 0x29, 0x00, 0x00, 0x00, // mov eax, 41 (socket)
-    0x0f, 0x05, // syscall  <-- issued from the RWX page
-    // NOTE: `ret` (0xc3) is appended at runtime; keeping the array at the
-    // instruction boundary above documents the syscall site clearly.
+    0x0f,
+    0x05, // syscall  <-- issued from the RWX page
+          // NOTE: `ret` (0xc3) is appended at runtime; keeping the array at the
+          // instruction boundary above documents the syscall site clearly.
 ];
 
 #[cfg(target_arch = "x86_64")]

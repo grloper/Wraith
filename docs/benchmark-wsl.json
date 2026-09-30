@@ -1,0 +1,24 @@
+{
+  "kernel": "5.15.167.4-microsoft-standard-WSL2",
+  "machine": "x86_64",
+  "iterations": 20000,
+  "samples": 5,
+  "baseline_seconds": [
+    0.016132015999971827,
+    0.015276447000019289,
+    0.014916796000022714,
+    0.015093258000035803,
+    0.016207990999987487
+  ],
+  "traced_seconds": [
+    2.0271260350000375,
+    2.1344983230000025,
+    2.143864178000001,
+    2.2334368580000046,
+    2.1877741399999877
+  ],
+  "median_baseline_seconds": 0.015276447000019289,
+  "median_traced_seconds": 2.143864178000001,
+  "median_slowdown": 140.33787948187785,
+  "scope": "Python startup plus getpid loop, wall clock, observe-only; not whole-system throughput"
+}

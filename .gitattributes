@@ -5,3 +5,5 @@
 # Windows turns the `#!/usr/bin/env bash` shebang into `bash\r`, which the
 # kernel then fails to resolve ("/usr/bin/env: 'bash\r': No such file...").
 *.sh text eol=lf
+.githooks/* text eol=lf
+*.py text eol=lf

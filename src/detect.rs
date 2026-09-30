@@ -18,8 +18,8 @@ use crate::syscalls;
 /// also intervenes to stop the attack in its tracks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Enforcement {
-    /// Detect and report only — never touch the tracee. The default, and the
-    /// only mode that is guaranteed side-effect-free.
+    /// Detect and report without rewriting syscalls or deliberately killing the
+    /// tracee. Ptrace observation still changes timing and execution scheduling.
     #[default]
     Observe,
     /// Neutralise the offending syscall in place: at its entry stop the syscall
@@ -36,9 +36,9 @@ pub enum Enforcement {
 /// Tunable behaviour.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Treat anonymous-executable origins as HIGH rather than WARN. Off by
-    /// default because legitimate JIT engines (browsers, JVMs) run code from
-    /// anonymous executable pages; on for hardened targets that never JIT.
+    /// Strict no-JIT policy: anonymous RX origins are HIGH, or CRITICAL for
+    /// sensitive syscalls. Default WARN because legitimate runtimes execute
+    /// generated code there; their input and W->X activity alone proves no exploit.
     pub jit_is_critical: bool,
     /// Enable the ROP stack-pivot heuristic.
     pub detect_stack_pivot: bool,
@@ -74,6 +74,28 @@ impl Config {
         self.trusted_regions
             .iter()
             .any(|&(start, end)| addr >= start && addr < end)
+    }
+
+    /// Exempt only if the effective page-rounded span is entirely trusted.
+    /// Ordinary x86-64 Linux mappings use 4096-byte base pages. This does not
+    /// infer existing hugetlb mapping sizes from maps metadata. Empty requests
+    /// and overflow receive no exemption; unaligned starts are rounded down.
+    pub fn is_trusted_range(&self, addr: u64, len: u64) -> bool {
+        const PAGE_MASK: u64 = 4095;
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = addr
+            .checked_add(len)
+            .and_then(|end| end.checked_add(PAGE_MASK))
+        else {
+            return false;
+        };
+        let first_page = addr & !PAGE_MASK;
+        let limit = end & !PAGE_MASK;
+        self.trusted_regions
+            .iter()
+            .any(|&(start, end)| first_page >= start && limit <= end)
     }
 }
 
@@ -128,7 +150,8 @@ impl Detector {
     /// evidence correlates into one exploitation chain.
     pub fn on_syscall(&mut self, proc_key: i32, ctx: &SyscallCtx, map: &MemoryMap) -> Vec<Event> {
         let mut events = Vec::new();
-        let sysname = syscalls::name(ctx.nr);
+        // Resolve display names only when a rule emits an event; unknown
+        // syscall names allocate, so quiet hot-path calls should not format them.
         // Disjoint field borrows: `cfg` is read-only, `chain` is the mutable
         // per-process accumulator for this address space.
         let cfg = &self.cfg;
@@ -152,18 +175,33 @@ impl Detector {
         //    region is exempt: the operator has vouched that runtime-generated
         //    code lives there, so a syscall from it is not evidence of injection.
         let origin = classify_rip(map, ctx.rip);
-        if origin.is_anomalous() && !cfg.is_trusted(ctx.rip) {
-            chain.foreign_origin = true;
+        let confirmed_origin = origin.is_anomalous()
+            && !matches!(origin, Origin::Unmapped | Origin::NonExec)
+            && (origin != Origin::AnonExec || cfg.jit_is_critical);
+        let trusted_origin = cfg.is_trusted(ctx.rip);
+        if origin.is_anomalous() && !trusted_origin {
+            let sysname = syscalls::name(ctx.nr);
+            chain.foreign_origin |= confirmed_origin;
             let sensitive = syscalls::is_sensitive(ctx.nr);
             let severity = foreign_severity(cfg, origin, sensitive);
-            let label = map.region_at(ctx.rip).map(|r| r.label()).unwrap_or_else(|| "unmapped".into());
-            let detail = if sensitive {
+            let label = map
+                .region_at(ctx.rip)
+                .map(|r| r.label())
+                .unwrap_or_else(|| "unmapped".into());
+            let detail = if matches!(origin, Origin::Unmapped | Origin::NonExec) {
+                format!("syscall `{sysname}` has {} provenance — memory-map uncertainty, not confirmed injection", origin.as_str())
+            } else if origin == Origin::AnonExec && !cfg.jit_is_critical {
+                format!("syscall `{sysname}` issued from anonymous executable memory — JIT or injected code")
+            } else if sensitive {
                 format!(
-                    "sensitive syscall `{sysname}` issued from {} memory — injected code is now acting",
+                    "sensitive syscall `{sysname}` issued from {} memory — possible injected code activity",
                     origin.as_str()
                 )
             } else {
-                format!("syscall `{sysname}` issued from {} memory (not legitimate code)", origin.as_str())
+                format!(
+                    "syscall `{sysname}` issued from {} memory (anomalous executable origin)",
+                    origin.as_str()
+                )
             };
             events.push(Event::now(
                 ctx.pid,
@@ -176,7 +214,11 @@ impl Detector {
                 detail,
             ));
         } else if cfg.audit_sensitive && syscalls::is_sensitive(ctx.nr) {
-            let label = map.region_at(ctx.rip).map(|r| r.label()).unwrap_or_else(|| "?".into());
+            let sysname = syscalls::name(ctx.nr);
+            let label = map
+                .region_at(ctx.rip)
+                .map(|r| r.label())
+                .unwrap_or_else(|| "?".into());
             events.push(Event::now(
                 ctx.pid,
                 Severity::Info,
@@ -193,8 +235,12 @@ impl Detector {
         if cfg.detect_stack_pivot {
             let ss = classify_rsp(map, ctx.rsp);
             if ss.is_anomalous() && ss != StackState::Unmapped {
+                let sysname = syscalls::name(ctx.nr);
                 chain.stack_pivot = true;
-                let label = map.region_at(ctx.rsp).map(|r| r.label()).unwrap_or_else(|| "?".into());
+                let label = map
+                    .region_at(ctx.rsp)
+                    .map(|r| r.label())
+                    .unwrap_or_else(|| "?".into());
                 events.push(Event::now(
                     ctx.pid,
                     Severity::High,
@@ -203,7 +249,10 @@ impl Detector {
                     ctx.rip,
                     ctx.rsp,
                     label,
-                    format!("stack pointer pivoted into {} at syscall time (ROP indicator)", ss.as_str()),
+                    format!(
+                        "stack pointer pivoted into {} at syscall time (ROP indicator)",
+                        ss.as_str()
+                    ),
                 ));
             }
         }
@@ -215,9 +264,17 @@ impl Detector {
         if syscalls::is_mmap(ctx.nr) || syscalls::is_mprotect(ctx.nr) {
             let prot = Prot::from_raw(ctx.args[2]);
             let addr = ctx.args[0];
-            if cfg.is_trusted(addr) {
+            // A plain mmap address is merely a hint; only fixed placement
+            // establishes which span the request would affect.
+            // MAP_HUGETLB has a larger, possibly selected page size; without
+            // that metadata a base-page trust calculation cannot exempt it.
+            let fixed_target = syscalls::is_mprotect(ctx.nr)
+                || (ctx.args[3] & (libc::MAP_FIXED | libc::MAP_FIXED_NOREPLACE) as u64 != 0
+                    && ctx.args[3] & libc::MAP_HUGETLB as u64 == 0);
+            if fixed_target && cfg.is_trusted_range(addr, ctx.args[1]) {
                 // Operator-vouched JIT page; not payload staging.
             } else if prot.is_wx() {
+                let sysname = syscalls::name(ctx.nr);
                 chain.wx_staged = true;
                 events.push(Event::now(
                     ctx.pid,
@@ -232,18 +289,25 @@ impl Detector {
             } else if syscalls::is_mprotect(ctx.nr) && prot.exec {
                 // Adding execute to a page that is currently writable is the
                 // W->X flip an attacker performs after writing a payload.
-                if let Some(region) = map.region_at(addr) {
-                    if region.write {
+                let writable = addr.checked_add(ctx.args[1]).and_then(|end| {
+                    map.regions()
+                        .iter()
+                        .find(|r| r.write && r.start < end && r.end > addr)
+                });
+                if ctx.args[1] != 0 {
+                    if let Some(region) = writable {
+                        let sysname = syscalls::name(ctx.nr);
                         chain.wx_staged = true;
                         events.push(Event::now(
                             ctx.pid,
-                            Severity::High,
+                            if cfg.jit_is_critical { Severity::High } else { Severity::Warn },
                             Kind::WxTransition,
                             sysname.clone(),
                             ctx.rip,
                             ctx.rsp,
                             region.label(),
-                            "writable page is being made executable — payload staging (W->X)".to_string(),
+                            "request to make writable memory executable — possible payload staging (W->X)"
+                                .to_string(),
                         ));
                     }
                 }
@@ -256,11 +320,13 @@ impl Detector {
         if !chain.chain_reported
             && chain.foreign_origin
             && syscalls::is_sensitive(ctx.nr)
-            && origin.is_anomalous()
+            && confirmed_origin
+            && !trusted_origin
             && chain.staging_count() >= 1
         {
             chain.chain_reported = true;
             let narrative = chain_narrative(chain);
+            let sysname = syscalls::name(ctx.nr);
             events.push(Event::now(
                 ctx.pid,
                 Severity::Critical,
@@ -286,6 +352,11 @@ impl Detector {
 }
 
 fn foreign_severity(cfg: &Config, origin: Origin, sensitive: bool) -> Severity {
+    if matches!(origin, Origin::Unmapped | Origin::NonExec)
+        || (origin == Origin::AnonExec && !cfg.jit_is_critical)
+    {
+        return Severity::Warn;
+    }
     if sensitive {
         return Severity::Critical;
     }
@@ -304,15 +375,15 @@ fn foreign_severity(cfg: &Config, origin: Origin, sensitive: bool) -> Severity {
 fn chain_narrative(chain: &ChainState) -> String {
     let mut steps = Vec::new();
     if chain.net_input {
-        steps.push("attacker-controlled input received");
+        steps.push("input syscall observed");
     }
     if chain.wx_staged {
-        steps.push("executable payload staged (W^X)");
+        steps.push("executable-memory staging request observed (W^X)");
     }
     if chain.stack_pivot {
         steps.push("stack pivot");
     }
-    steps.push("sensitive syscall from injected code");
+    steps.push("sensitive syscall from anomalous executable memory");
     format!("EXPLOITATION CHAIN: {}", steps.join(" -> "))
 }
 
@@ -335,7 +406,212 @@ mod tests {
     }
 
     fn ctx(nr: u64, rip: u64, rsp: u64, args: [u64; 6]) -> SyscallCtx {
-        SyscallCtx { pid: 1, nr, rip, rsp, args }
+        SyscallCtx {
+            pid: 1,
+            nr,
+            rip,
+            rsp,
+            args,
+        }
+    }
+
+    #[test]
+    fn trusted_origin_does_not_inherit_foreign_chain() {
+        let m = MemoryMap::parse(&format!("{MAP}\n7f0000060000-7f0000061000 r-xp 0 00:00 0"));
+        let cfg = Config {
+            trusted_regions: vec![(0x7f0000060000, 0x7f0000061000)],
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        d.on_syscall(1, &ctx(0, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &m);
+        let ev = d.on_syscall(1, &ctx(59, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+        assert!(
+            ev.is_empty(),
+            "trusted current origin must not inherit a chain: {ev:?}"
+        );
+    }
+
+    #[test]
+    fn trust_covers_effective_page_rounded_memory_span() {
+        let cfg = Config {
+            trusted_regions: vec![(0x1000, 0x1001)],
+            ..Config::default()
+        };
+        assert!(!cfg.is_trusted_range(0x1000, 1));
+        let mut d = Detector::new(cfg);
+        let ev = d.on_syscall(
+            1,
+            &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x1000, 1, 7, 0, 0, 0]),
+            &map(),
+        );
+        assert!(ev.iter().any(|e| e.kind == Kind::WxViolation));
+        let full = Config {
+            trusted_regions: vec![(0x1000, 0x2000)],
+            ..Config::default()
+        };
+        assert!(full.is_trusted_range(0x1000, 1));
+        assert!(!full.is_trusted_range(0x1000, 0x1001));
+        let top = Config {
+            trusted_regions: vec![(u64::MAX - 0xfff, u64::MAX)],
+            ..Config::default()
+        };
+        assert!(!top.is_trusted_range(u64::MAX - 0xfff, 1));
+    }
+
+    #[test]
+    fn trusted_ranges_reject_overflow_and_empty_spans() {
+        let cfg = Config {
+            trusted_regions: vec![(0x1000, 0x2000), (u64::MAX - 0x1000, u64::MAX)],
+            ..Config::default()
+        };
+        assert!(cfg.is_trusted_range(0x1000, 0x1000));
+        assert!(!cfg.is_trusted_range(0x1000, 0));
+        assert!(!cfg.is_trusted_range(0x1000, 0x1001));
+        assert!(!cfg.is_trusted_range(u64::MAX - 1, 2));
+    }
+
+    #[test]
+    fn hugetlb_fixed_mmap_does_not_receive_base_page_trust_exemption() {
+        let mut d = Detector::new(Config {
+            trusted_regions: vec![(0x1000, 0x2000)],
+            ..Config::default()
+        });
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                9,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [
+                    0x1000,
+                    1,
+                    7,
+                    (libc::MAP_PRIVATE | libc::MAP_FIXED | libc::MAP_HUGETLB) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &map(),
+        );
+        assert!(ev.iter().any(|e| e.kind == Kind::WxViolation));
+    }
+
+    #[test]
+    fn mmap_hint_does_not_establish_trusted_mapping() {
+        let mut d = Detector::new(Config {
+            trusted_regions: vec![(0x1000, 0x2000)],
+            ..Config::default()
+        });
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                9,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x1000, 0x1000, 7, libc::MAP_PRIVATE as u64, 0, 0],
+            ),
+            &map(),
+        );
+        assert!(ev.iter().any(|e| e.kind == Kind::WxViolation));
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                9,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [
+                    0x1000,
+                    0x1000,
+                    7,
+                    (libc::MAP_PRIVATE | libc::MAP_FIXED) as u64,
+                    0,
+                    0,
+                ],
+            ),
+            &map(),
+        );
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn mprotect_detects_writable_later_region() {
+        let m = MemoryMap::parse(&format!(
+            "{MAP}\n1000-2000 r-xp 0 00:00 0\n2000-3000 rw-p 0 00:00 0"
+        ));
+        let mut d = Detector::new(Config::default());
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x1000, 0x2000, 5, 0, 0, 0],
+            ),
+            &m,
+        );
+        assert!(ev.iter().any(|e| e.kind == Kind::WxTransition));
+    }
+
+    #[test]
+    fn trusted_start_does_not_exempt_untrusted_tail() {
+        let cfg = Config {
+            trusted_regions: vec![(0x7f0000050000, 0x7f0000051000)],
+            ..Config::default()
+        };
+        let mut d = Detector::new(cfg);
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x2000, 7, 0, 0, 0],
+            ),
+            &map(),
+        );
+        assert!(ev.iter().any(|e| e.kind == Kind::WxViolation));
+    }
+
+    #[test]
+    fn rx_jit_sensitive_with_input_is_not_confirmed_injection_by_default() {
+        let m = MemoryMap::parse(&format!("{MAP}\n7f0000060000-7f0000061000 r-xp 0 00:00 0"));
+        let mut d = Detector::new(Config::default());
+        d.on_syscall(1, &ctx(0, 0x7f0000000500, 0x7ffd00010000, [0; 6]), &m);
+        d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, 5, 0, 0, 0],
+            ),
+            &m,
+        );
+        let ev = d.on_syscall(1, &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+        assert!(ev.iter().any(|e| e.kind == Kind::ForeignOriginSyscall));
+        assert!(!ev.iter().any(|e| e.severity == Severity::Critical));
+        let mut strict = Detector::new(Config {
+            jit_is_critical: true,
+            ..Config::default()
+        });
+        let ev = strict.on_syscall(1, &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+        assert!(ev.iter().any(|e| e.severity == Severity::Critical));
+    }
+
+    #[test]
+    fn uncertain_origins_never_become_critical() {
+        for rip in [0xdead0000, 0x7f0000050010] {
+            let mut d = Detector::new(Config {
+                jit_is_critical: true,
+                ..Config::default()
+            });
+            d.on_syscall(1, &ctx(0, 0x7f0000000500, 0x7ffd00010000, [0; 6]), &map());
+            let ev = d.on_syscall(1, &ctx(59, rip, 0x7ffd00010000, [0; 6]), &map());
+            assert!(
+                !ev.iter().any(|e| e.severity == Severity::Critical),
+                "{ev:?}"
+            );
+        }
     }
 
     #[test]
@@ -359,8 +635,71 @@ mod tests {
         let mut d = Detector::new(Config::default());
         // execve (59) from the RWX page.
         let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
-        assert!(ev.iter().any(|e| e.severity == Severity::Critical
-            && e.kind == Kind::ForeignOriginSyscall));
+        assert!(ev
+            .iter()
+            .any(|e| e.severity == Severity::Critical && e.kind == Kind::ForeignOriginSyscall));
+    }
+
+    #[test]
+    fn pkey_mprotect_checks_wx_and_writable_transition() {
+        for (prot, expected) in [(7, Kind::WxViolation), (5, Kind::WxTransition)] {
+            let mut d = Detector::new(Config::default());
+            let ev = d.on_syscall(
+                1,
+                &ctx(
+                    329,
+                    0x7f0000000500,
+                    0x7ffd00010000,
+                    [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+                ),
+                &map(),
+            );
+            assert!(ev
+                .iter()
+                .any(|e| e.kind == expected && e.syscall == "pkey_mprotect"));
+        }
+    }
+
+    #[test]
+    fn wx_transition_policy_distinguishes_jit_from_direct_rwx() {
+        for strict in [false, true] {
+            for nr in [10, 329] {
+                let mut d = Detector::new(Config {
+                    jit_is_critical: strict,
+                    ..Config::default()
+                });
+                let ev = d.on_syscall(
+                    1,
+                    &ctx(
+                        nr,
+                        0x7f0000000500,
+                        0x7ffd00010000,
+                        [0x7f0000050000, 0x1000, 5, 0, 0, 0],
+                    ),
+                    &map(),
+                );
+                assert!(ev.iter().any(|e| e.kind == Kind::WxTransition
+                    && e.severity
+                        == if strict {
+                            Severity::High
+                        } else {
+                            Severity::Warn
+                        }));
+                let ev = d.on_syscall(
+                    1,
+                    &ctx(
+                        nr,
+                        0x7f0000000500,
+                        0x7ffd00010000,
+                        [0x7f0000050000, 0x1000, 7, 0, 0, 0],
+                    ),
+                    &map(),
+                );
+                assert!(ev
+                    .iter()
+                    .any(|e| e.kind == Kind::WxViolation && e.severity == Severity::High));
+            }
+        }
     }
 
     #[test]
@@ -368,7 +707,16 @@ mod tests {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
         // Called from legit code, so the only event is the W^X violation.
-        let ev = d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+            ),
+            &map(),
+        );
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].kind, Kind::WxViolation);
     }
@@ -377,7 +725,16 @@ mod tests {
     fn mprotect_wx_transition_on_writable_page() {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_EXEC) as u64; // exec only, but page is writable
-        let ev = d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        let ev = d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+            ),
+            &map(),
+        );
         assert!(ev.iter().any(|e| e.kind == Kind::WxTransition));
     }
 
@@ -393,11 +750,21 @@ mod tests {
         let mut d = Detector::new(Config::default());
         // Step 1: stage RWX via mprotect (from legit code).
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+            ),
+            &map(),
+        );
         // Step 2: execve from the injected RWX page.
         let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
-        assert!(ev.iter().any(|e| e.kind == Kind::ExploitationChain
-            && e.severity == Severity::Critical));
+        assert!(ev
+            .iter()
+            .any(|e| e.kind == Kind::ExploitationChain && e.severity == Severity::Critical));
     }
 
     #[test]
@@ -410,7 +777,10 @@ mod tests {
         };
         let mut d = Detector::new(cfg);
         let ev = d.on_syscall(1, &ctx(1, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
-        assert!(ev.is_empty(), "trusted JIT region must not raise a foreign-origin event");
+        assert!(
+            ev.is_empty(),
+            "trusted JIT region must not raise a foreign-origin event"
+        );
     }
 
     #[test]
@@ -425,10 +795,18 @@ mod tests {
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
         let staging = d.on_syscall(
             1,
-            &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000030000, 0x1000, prot, 0, 0, 0]),
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000030000, 0x1000, prot, 0, 0, 0],
+            ),
             &map(),
         );
-        assert!(staging.is_empty(), "W^X inside a trusted region must be exempt");
+        assert!(
+            staging.is_empty(),
+            "W^X inside a trusted region must be exempt"
+        );
         let firing = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(
             firing.is_empty(),
@@ -453,7 +831,16 @@ mod tests {
     fn chain_reported_only_once() {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
+        d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+            ),
+            &map(),
+        );
         let first = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         let second = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(first.iter().any(|e| e.kind == Kind::ExploitationChain));
@@ -465,11 +852,26 @@ mod tests {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
         // Stage a W^X milestone so the address space has accumulated evidence.
-        d.on_syscall(1, &ctx(10, 0x7f0000000500, 0x7ffd00010000, [0x7f0000050000, 0x1000, prot, 0, 0, 0]), &map());
-        assert!(d.chains.contains_key(&1), "staging should record chain state");
+        d.on_syscall(
+            1,
+            &ctx(
+                10,
+                0x7f0000000500,
+                0x7ffd00010000,
+                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
+            ),
+            &map(),
+        );
+        assert!(
+            d.chains.contains_key(&1),
+            "staging should record chain state"
+        );
 
         d.retire(1);
-        assert!(!d.chains.contains_key(&1), "retire must free the chain entry");
+        assert!(
+            !d.chains.contains_key(&1),
+            "retire must free the chain entry"
+        );
 
         // A recycled key starts clean: a lone foreign-origin sensitive syscall
         // has no prior staging to correlate with, so no chain is reported.
