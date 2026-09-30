@@ -3,4 +3,5 @@
 *.jsonl
 /.board/
 /.obsidian_vault/
+/src/graphify-out/
 /docs/demo-output/

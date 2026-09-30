@@ -51,7 +51,16 @@ includes 64 alternating single/worker-thread targets inside one integration test
 `bash scripts/verify.sh`, the six-case demo, offline docs checks, local sensor archive
 checksum validation and full `cargo package --locked --allow-dirty` verification all
 passed. Source-package verification rebuilt the packaged crate, not just its manifest.
-Independent proof-gated board review is tracked separately below.
+Independent proof-gated review completed: `WRAITH-CORE-V2`, `WRAITH-DEMO-V2`
+and `WRAITH-RELEASE-V2` were each rerun and approved by a separate verifier who
+made no source edits. Their checks cover strict tests, Clippy, asserted demos,
+docs, full release verification and rebuilt Cargo packaging. Board audit reported
+an **intact 39-event chain**, head `4ffd6dba51ae0891`.
+
+Original ticket checks used PowerShell quoting that the Windows board executor
+interpreted as cmd.exe syntax. Those three records remain blocked with the
+execution error preserved; quote-free V2 checks supersede them. No failed check
+was relabeled as a pass or manually closed.
 
 ## RED/GREEN index
 

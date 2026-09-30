@@ -31,6 +31,9 @@ outcome interpretation harder. A second tracer may conflict with debuggers.
 
 Do not equate a CRITICAL event with proven malicious intent. Do not tune by
 silencing all unknown memory. An excluded arena is an intentional blind spot.
+Trust-span rounding uses ordinary 4096-byte x86-64 base pages. Huge-page mmap
+requests are not exempted; existing hugetlb mapping sizes are not inferred from
+maps metadata. Do not use protection trust exemptions for huge-page arenas.
 
 ## Evidence and exit codes
 
