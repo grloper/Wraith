@@ -14,16 +14,43 @@ fn cli(args: &[&str]) -> Output {
 
 #[test]
 fn json_stdout_is_not_contaminated_by_target_output() {
-    let output = cli(&["run", "--quiet", "--json", "-", "--", "/bin/echo", "NOT_JSON"]);
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(output.stdout.is_empty(), "target stdout polluted JSON: {:?}", output.stdout);
+    let output = cli(&[
+        "run",
+        "--quiet",
+        "--json",
+        "-",
+        "--",
+        "/bin/echo",
+        "NOT_JSON",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "target stdout polluted JSON: {:?}",
+        output.stdout
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("NOT_JSON"));
 }
 
 #[test]
 fn failed_json_sink_is_an_operational_error() {
-    let output = cli(&["run", "--json", "/dev/full", "--", env!("CARGO_BIN_EXE_shellcode-sim")]);
-    assert_eq!(output.status.code(), Some(2), "lost telemetry must not look like a complete run");
+    let output = cli(&[
+        "run",
+        "--json",
+        "/dev/full",
+        "--",
+        env!("CARGO_BIN_EXE_shellcode-sim"),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "lost telemetry must not look like a complete run"
+    );
     assert!(String::from_utf8_lossy(&output.stderr).contains("JSON"));
 }
 

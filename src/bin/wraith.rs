@@ -27,6 +27,7 @@ use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use wraith::detect::{Config, Enforcement};
+use wraith::engine::Backend;
 use wraith::event::{Event, Severity};
 use wraith::tracer::Tracer;
 use wraith::ui::{Dashboard, TerminalGuard};
@@ -91,7 +92,11 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
             }
             "--json" => {
                 i += 1;
-                opts.json = Some(rest.get(i).cloned().ok_or_else(|| bad("--json needs a value"))?);
+                opts.json = Some(
+                    rest.get(i)
+                        .cloned()
+                        .ok_or_else(|| bad("--json needs a value"))?,
+                );
             }
             "--min" => {
                 i += 1;
@@ -101,20 +106,36 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
             "--jit-critical" => opts.cfg.jit_is_critical = true,
             "--trust-region" => {
                 i += 1;
-                let v = rest.get(i).ok_or_else(|| bad("--trust-region needs a START-END range"))?;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| bad("--trust-region needs a START-END range"))?;
                 opts.cfg.trusted_regions.push(parse_region(v)?);
             }
-            "--block" => opts.cfg.enforcement = Enforcement::Block,
-            "--kill" => opts.cfg.enforcement = Enforcement::Kill,
+            "--block" => {
+                if opts.cfg.enforcement == Enforcement::Kill {
+                    return Err(bad("--block and --kill are mutually exclusive"));
+                }
+                opts.cfg.enforcement = Enforcement::Block;
+            }
+            "--kill" => {
+                if opts.cfg.enforcement == Enforcement::Block {
+                    return Err(bad("--block and --kill are mutually exclusive"));
+                }
+                opts.cfg.enforcement = Enforcement::Kill;
+            }
             "--match" => {
                 i += 1;
-                let v = rest.get(i).ok_or_else(|| bad("--match needs a substring"))?;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| bad("--match needs a substring"))?;
                 scan_matches.push(v.clone());
             }
             "--all" => scan_all = true,
             "--max-targets" => {
                 i += 1;
-                let v = rest.get(i).ok_or_else(|| bad("--max-targets needs a number"))?;
+                let v = rest
+                    .get(i)
+                    .ok_or_else(|| bad("--max-targets needs a number"))?;
                 max_targets = Some(
                     v.parse::<usize>()
                         .ok()
@@ -181,7 +202,9 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     let tracer = match mode.as_str() {
         "run" => {
             if target.is_empty() {
-                return Err(bad("no program to run; use: wraith run -- <program> [args...]"));
+                return Err(bad(
+                    "no program to run; use: wraith run -- <program> [args...]",
+                ));
             }
             ui_label = format!("run — {}", target.join(" "));
             if !ui {
@@ -190,7 +213,7 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                     target.join(" ")
                 );
             }
-            Tracer::spawn(&target, opts.cfg)?
+            Tracer::spawn_with_output(&target, opts.cfg, opts.json.as_deref() == Some("-"))?
         }
         "attach" => {
             let pid = attach_pid.ok_or_else(|| bad("attach needs a pid"))?;
@@ -243,12 +266,15 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         }
     };
 
+    let mut output_failed = false;
     let summary = if ui {
-        // Live dashboard: the tracer drives a Dashboard reporter inside a guard
-        // that restores the terminal on exit (and on Ctrl-C via a signal handler).
-        let dash = Dashboard::new(ui_label, enforcement, min, json_sink);
+        // Retain the reporter so evidence-sink failure remains visible after the
+        // alternate screen is restored, and takes precedence in sensor status.
+        let mut dash = Dashboard::new(ui_label, enforcement, min, json_sink);
         let _guard = TerminalGuard::enter()?;
-        tracer.run_with(dash)?
+        let summary = Box::new(tracer).drive(&mut dash)?;
+        output_failed = dash.sink_failed();
+        summary
     } else {
         // Plain stream: colored log lines to stderr, optional JSONL to the sink.
         let mut json_sink = json_sink;
@@ -271,7 +297,14 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                 }
             }
         };
-        tracer.run(&mut on_event)?
+        let summary = tracer.run(&mut on_event)?;
+        if let Some(sink) = json_sink.as_mut() {
+            if sink.flush().is_err() {
+                json_broken = true;
+            }
+        }
+        output_failed |= json_broken;
+        summary
     };
 
     // A short verdict on stderr so a human sees the bottom line.
@@ -281,6 +314,17 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         summary.events,
         verdict(summary.max_severity),
     );
+
+    if let Some(code) = summary.exit_code {
+        eprintln!("wraith: target exit: {code}");
+    } else if let Some(signal) = summary.term_signal {
+        eprintln!("wraith: target signal: {signal}");
+    }
+    if output_failed {
+        return Err(io::Error::other(
+            "JSON evidence sink failed; event stream is incomplete",
+        ));
+    }
 
     // Exit non-zero when something serious fired, so wraith is CI/pipeline
     // friendly (a HIGH/CRITICAL trips the build).
@@ -378,9 +422,9 @@ fn proc_matches(comm: &str, cmdline: &str, needles: &[String], all: bool) -> boo
 /// Parse a `START-END` hex range (each side optionally `0x`-prefixed) into a
 /// half-open `[start, end)` pair, e.g. `7f0000030000-7f0000031000`.
 fn parse_region(s: &str) -> io::Result<(u64, u64)> {
-    let (a, b) = s
-        .split_once('-')
-        .ok_or_else(|| bad("--trust-region wants START-END (hex), e.g. 7f00aa000000-7f00aa010000"))?;
+    let (a, b) = s.split_once('-').ok_or_else(|| {
+        bad("--trust-region wants START-END (hex), e.g. 7f00aa000000-7f00aa010000")
+    })?;
     let parse_hex = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16);
     let start = parse_hex(a).map_err(|_| bad("--trust-region START is not hex"))?;
     let end = parse_hex(b).map_err(|_| bad("--trust-region END is not hex"))?;
@@ -468,8 +512,18 @@ mod tests {
     #[test]
     fn match_by_comm_or_cmdline() {
         let n = needles(&["nginx"]);
-        assert!(proc_matches("nginx", "/usr/sbin/nginx -g daemon off;", &n, false));
-        assert!(proc_matches("worker", "/usr/sbin/nginx: worker process", &n, false));
+        assert!(proc_matches(
+            "nginx",
+            "/usr/sbin/nginx -g daemon off;",
+            &n,
+            false
+        ));
+        assert!(proc_matches(
+            "worker",
+            "/usr/sbin/nginx: worker process",
+            &n,
+            false
+        ));
         assert!(!proc_matches("sshd", "/usr/sbin/sshd -D", &n, false));
     }
 

@@ -65,10 +65,21 @@ impl Dashboard {
         }
     }
 
+    /// Whether the evidence sink failed during this run.
+    pub fn sink_failed(&self) -> bool {
+        self.sink_error
+    }
+
     /// Build the frame as a vector of already-styled lines, each with a visible
     /// width no greater than `cols`. Split out from painting so it can be unit
     /// tested without a terminal.
-    fn frame(&self, stats: &[ProcStat], summary: &Summary, cols: usize, rows: usize) -> Vec<String> {
+    fn frame(
+        &self,
+        stats: &[ProcStat],
+        summary: &Summary,
+        cols: usize,
+        rows: usize,
+    ) -> Vec<String> {
         let cols = cols.max(20);
         let elapsed = self.elapsed();
         let mut out = Vec::new();
@@ -113,7 +124,11 @@ impl Dashboard {
         out.push(dim(&padr(
             &format!(
                 "  {:>6} {:<name_w$} {:>8} {:>6}  {}",
-                "PID", "PROCESS", "SYSCALLS", "EVENTS", "VERDICT",
+                "PID",
+                "PROCESS",
+                "SYSCALLS",
+                "EVENTS",
+                "VERDICT",
                 name_w = name_w
             ),
             cols,
@@ -197,7 +212,10 @@ impl Reporter for Dashboard {
             // A failed write (full disk, broken pipe) must not be swallowed: for a
             // security sensor a lost detection is the worst possible outcome, so
             // remember it and let the frame flag it to the operator.
-            if writeln!(sink, "{}", ev.to_json()).and_then(|_| sink.flush()).is_err() {
+            if writeln!(sink, "{}", ev.to_json())
+                .and_then(|_| sink.flush())
+                .is_err()
+            {
                 self.sink_error = true;
             }
         }
@@ -468,7 +486,14 @@ mod tests {
         out
     }
 
-    fn stat(tgid: i32, name: &str, sys: u64, ev: u64, sev: Option<Severity>, alive: bool) -> ProcStat {
+    fn stat(
+        tgid: i32,
+        name: &str,
+        sys: u64,
+        ev: u64,
+        sev: Option<Severity>,
+        alive: bool,
+    ) -> ProcStat {
         ProcStat {
             tgid,
             name: name.to_string(),
@@ -480,7 +505,12 @@ mod tests {
     }
 
     fn dash() -> Dashboard {
-        Dashboard::new("scan --match nginx".into(), Enforcement::Kill, Severity::Warn, None)
+        Dashboard::new(
+            "scan --match nginx".into(),
+            Enforcement::Kill,
+            Severity::Warn,
+            None,
+        )
     }
 
     #[test]
@@ -506,7 +536,14 @@ mod tests {
         let d = dash();
         let stats = vec![
             stat(100, "nginx", 1200, 0, None, true),
-            stat(101, "nginx: worker", 3400, 3, Some(Severity::Critical), true),
+            stat(
+                101,
+                "nginx: worker",
+                3400,
+                3,
+                Some(Severity::Critical),
+                true,
+            ),
             stat(102, "redis-server", 890, 0, Some(Severity::Warn), false),
         ];
         let summary = Summary {
@@ -543,7 +580,10 @@ mod tests {
             .join("\n");
         assert!(text.contains("nginx"), "process name missing:\n{text}");
         assert!(text.contains("4242"), "pid missing");
-        assert!(text.contains("EXPLOITATION"), "critical verdict missing:\n{text}");
+        assert!(
+            text.contains("EXPLOITATION"),
+            "critical verdict missing:\n{text}"
+        );
         assert!(text.contains("scan --match nginx"), "mode label missing");
     }
 
@@ -551,10 +591,31 @@ mod tests {
     fn feed_records_and_caps() {
         let mut d = dash();
         // Below-min events are dropped from the feed.
-        d.event(&Event::now(1, Severity::Info, Kind::SensitiveCall, "read", 0, 0, "libc", "info"));
-        assert!(d.feed.is_empty(), "info event below warn floor must not be fed");
+        d.event(&Event::now(
+            1,
+            Severity::Info,
+            Kind::SensitiveCall,
+            "read",
+            0,
+            0,
+            "libc",
+            "info",
+        ));
+        assert!(
+            d.feed.is_empty(),
+            "info event below warn floor must not be fed"
+        );
         for i in 0..(FEED_CAP + 50) {
-            d.event(&Event::now(1, Severity::High, Kind::WxViolation, "mmap", i as u64, 0, "anon", "x"));
+            d.event(&Event::now(
+                1,
+                Severity::High,
+                Kind::WxViolation,
+                "mmap",
+                i as u64,
+                0,
+                "anon",
+                "x",
+            ));
         }
         assert_eq!(d.feed.len(), FEED_CAP, "feed must be capped");
     }
@@ -572,15 +633,30 @@ mod tests {
         // A comm containing a clear-screen escape must never emit the live escape
         // into the table; the neutered literal text remains.
         let row = proc_row(&stat(1, "evil\x1b[2Jname", 0, 0, None, true), 20, 80);
-        assert!(!row.contains("\x1b[2J"), "clear-screen escape from comm must be stripped");
+        assert!(
+            !row.contains("\x1b[2J"),
+            "clear-screen escape from comm must be stripped"
+        );
         assert!(strip_ansi(&row).contains("evil[2Jname"));
     }
 
     #[test]
     fn event_row_neutralizes_hostile_origin() {
-        let ev = Event::now(1, Severity::High, Kind::WxViolation, "mmap", 0x10, 0x20, "lbl\x1b[2Jx", "d");
+        let ev = Event::now(
+            1,
+            Severity::High,
+            Kind::WxViolation,
+            "mmap",
+            0x10,
+            0x20,
+            "lbl\x1b[2Jx",
+            "d",
+        );
         let row = event_row(&ev, 200);
-        assert!(!row.contains("\x1b[2J"), "escape from origin label must be stripped");
+        assert!(
+            !row.contains("\x1b[2J"),
+            "escape from origin label must be stripped"
+        );
     }
 
     #[test]
@@ -601,7 +677,16 @@ mod tests {
             Severity::Warn,
             Some(Box::new(FailWriter)),
         );
-        d.event(&Event::now(1, Severity::High, Kind::WxViolation, "mmap", 0, 0, "anon", "x"));
+        d.event(&Event::now(
+            1,
+            Severity::High,
+            Kind::WxViolation,
+            "mmap",
+            0,
+            0,
+            "anon",
+            "x",
+        ));
         assert!(d.sink_error, "a failed sink write must be recorded");
         let frame = d.frame(&[], &Summary::default(), 120, 24).join("\n");
         assert!(
