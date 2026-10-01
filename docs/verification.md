@@ -1,5 +1,83 @@
 # Verification evidence
 
+## Maintained investigation foundations (development snapshot)
+
+The current Rust source passes **130 tests** on stable and MSRV **1.74.0**, with
+zero ignored tests in strict ptrace mode: 87 library, 5 binary-unit, 4 CLI,
+4 doctor, 23 integration, 1 job-control, 2 file-permission and 4 policy-control tests.
+Stable Clippy with warnings denied passes. Standalone helpers pass 33 report tests
+(on Linux and Windows) and 22 workload tests. Line/branch coverage remains unmeasured.
+
+Concrete RED→GREEN evidence includes stale-map enforcement under injected reader
+failure, retired PID reuse and 513-row growth, actual heap-backed signal-stack
+pivots (16 HIGH placements across eight signals → zero), failed/zero input and
+successful-return span/expiry controls, partial `mprotect` ENOMEM effects, terminal
+control injection, and rate-limited coverage notices. OS-thread wait regressions
+first reproduced ECHILD/unrelated-child reaping and bounded concurrent-tracer
+failure; `__WNOTHREAD` preserves independently owned outcomes without claiming
+same-thread arbitrary-child safety.
+
+The owned-child preflight had three intended failures before implementation;
+policy knobs had four. New-file privacy reproduced mode 0666 under permissive
+child umask, then 0600 with existing 0640 permissions preserved. Unrelated
+in-flight compile failures were not counted as those behavior REDs.
+
+Independent static review found inherited-target-directory stale packaging and
+relative-sensor hash/execute identity mismatch. Actual same-version ELF canaries
+failed both Debian and archive freshness checks before actual Cargo artifact paths
+were selected. Package verification inspects before extraction, executes the
+trusted self-built binary, validates positive/negative controls and reproduces
+identical `.deb` bytes for fixed inputs/epoch. It does not install the package,
+prove Kali compatibility, or certify cross-compiler reproducibility.
+
+The first real Java control completed successfully while two handled SIGSEGV
+delivery stops were incorrectly HIGH crash events. Global signal-outcome tests
+reproduced that defect before the fix: delivery is INFO, and HIGH crash requires
+confirmed terminal status. Fatal controls cover SEGV/ILL/BUS/ABRT/FPE and a worker
+thread, with one terminal event per group and process-local core dumps disabled.
+This is not a Java trust exclusion or a root-cause attestation.
+
+Final five-pair [WSL service samples](benchmark-workloads-wsl.json) measured HTTP20
+median 125.537→421.720 ms (3.359×) and SQLite200 564.563→1696.223 ms (3.004×).
+Imports/startup/shutdown are included, with alternating order and no warmup.
+The empirical five-sample p95 is the maximum sample, not a population tail estimate.
+All ten traced workload runs completed with sensor/target 0 and no emitted events
+or reported operational loss. [Runtime controls](runtime-controls-wsl.json):
+Python clean; Node unavailable; Java target 0/sensor 1 with four HIGH RWX requests,
+no emitted crash/CRITICAL records. Two INFO delivery events remain counted
+internally but filtered by the default JSON reporting threshold. This is not zero
+false positives or proof of complete coverage.
+
+Captured sensor SHA256:
+`6f038dbda437287511b7da0d65c9d85d21d37066aba6860d3e78b6f83a89939b`.
+The artifacts retain raw samples/events, runner/source fingerprints, dirty capture
+HEAD and before/after consistency checks. A source snapshot is not compiler
+attestation. The historical 140.338× getpid result below is a different workload,
+not a claimed before/after optimization.
+
+Eight scoped missions were independently rerun and approved by a non-author
+verifier: CORE, OPS, PACKAGE, EVENT-TRIAGE, WORKLOAD-EVIDENCE, WAIT-ISOLATION,
+SIGNAL-OUTCOMES and PRIVATE-LOGS. Every machine acceptance check passed again;
+audit head at that boundary: `c258de0676c50c99`. The independent artifact validator
+also recomputed workload medians/outcomes and matched every source-input, runner
+and sensor hash. Release qualification is a separate ninth gate, not inferred
+from advisory output or these notes.
+
+### Current delivery self-assessment
+
+Accuracy **4/5**: real failures, current raw data and independent proofs, but map
+snapshots are not atomic and native fleets remain unqualified. Completeness
+**3/5** against the flagship ambition: focused investigation is substantially
+improved; a low-overhead backend, official distro inclusion and production rollout
+are future gated work. Clarity **4/5**: the quickstart routes detailed limitations
+to guides, but there are several distinct counters/statuses. Actionability **4/5**:
+usable local packages/workflows, with native VM install qualification still needed.
+Conciseness **4/5**: meaningful regression detail is longer than a release summary.
+Overall **3.8/5**. Highest-impact next work: native workload/kernel validation,
+measured lower-overhead observation research, then disposable Debian/Kali install
+qualification. The user should judge this as a maintained flagship foundation,
+not a completed EDR, guaranteed valuation, or arbitrary performance multiplier.
+
 ## Baseline
 
 The original revision `93a1473` passed 49 library tests, 5 CLI unit tests and

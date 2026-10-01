@@ -41,6 +41,26 @@ memory is not alone proof of exploitation.
 no-JIT policy for elevation. Protection-request exclusions must cover the entire
 span; an `mmap` address hint is not the kernel's actual chosen mapping address.
 
+## Completed evidence and partial failure
+
+A syscall entry describes a request, not its result. Correlation now consumes
+actual exit outcomes: positive input only, successful protection candidates and
+actual mmap return addresses. Evidence is address-span-bound and expires; it is
+not a causal input-to-code graph.
+
+A controlled three-page WSL reproduction unmapped the middle page and requested
+RX protection for the whole span. `mprotect` returned `ENOMEM`, yet the first page
+had become RX. Failure must **not** imply no mapping change. The corresponding
+live fixture and exit-side invalidation preserve that distinction; the
+[Linux mprotect implementation](https://github.com/torvalds/linux/blob/v5.15/mm/mprotect.c)
+also provides the relevant VMA-by-VMA context. This observed kernel behavior is not
+an assertion that every failure changes pages on every kernel.
+
+A failed required map refresh cannot justify using an old RWX snapshot for a new
+intervention. The engine invalidates decision state, surfaces a coverage notice
+and retains the run's failed-decision count after recovery. Output filters do not
+turn that incomplete run into a clean result.
+
 ## 4. Heap stacks can be legitimate
 
 [`sigaltstack(2)`](https://man7.org/linux/man-pages/man2/sigaltstack.2.html) supports
@@ -49,8 +69,11 @@ allocates one with `malloc`. User-space coroutine stacks can also differ from a
 conventional main-thread stack.
 
 **Decision:** retain stack placement only as a documented optional heuristic,
-not an invariant. Do not automatically treat ordinary input plus a pivot as
-conclusive injection. Runtime-aware stack enrollment remains a future feature.
+not an invariant. Successfully observed native `sigaltstack` registrations enroll
+only that thread's stack extent after the kernel accepts the request. This changes
+stack-placement interpretation, not executable-memory or syscall-origin trust.
+Registrations predating attachment, fork-inherited configurations and general
+coroutine stacks still need separate treatment; do not trust all heap memory.
 
 ## 5. eBPF observation is not ptrace enforcement
 
@@ -65,8 +88,10 @@ benchmark, privilege model and hook-specific enforcement design.
 
 ## What still needs research
 
-1. Allocation-level correlation that ages evidence and tracks successful returns.
-2. Runtime-owned JIT/alternate-stack enrollment without broad trust exclusions.
+1. Finer allocation identity/address-reuse and concurrent-map causality beyond the
+   implemented successful, expiring address-span context.
+2. Runtime-owned JIT attestation and preexisting/inherited/coroutine stack awareness
+   beyond observed per-thread signal-stack registration.
 3. File-backed page integrity and dual-mapping attacks without per-syscall hashing.
 4. Real-service overhead, false positives and job-control behavior on supported kernels.
 5. Address spaces shared outside conventional thread groups.

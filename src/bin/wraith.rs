@@ -10,6 +10,8 @@
 //!   --min <SEV>          minimum severity to report: info|warn|high|critical
 //!   --jit-critical       treat anonymous-exec origins as HIGH (no-JIT targets)
 //!   --trust-region A-B   treat the hex range [A,B) as legitimate JIT (repeatable)
+//!   --correlation-window N  evidence budget in syscall entries (default 64)
+//!   --max-history N      retained dead process rows (default 128; live rows remain)
 //!   --block              neutralise the offending syscall on detection
 //!   --kill               SIGKILL the traced tree on detection
 //!   --match <substr>     (scan) attach to processes whose name/cmdline matches
@@ -24,6 +26,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::ExitCode;
 
 use wraith::detect::{Config, Enforcement};
@@ -62,6 +65,37 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
     if args[0] == "-V" || args[0] == "--version" {
         println!("wraith {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if args[0] == "doctor" {
+        let json = match &args[1..] {
+            [] => false,
+            [flag] if flag == "--json" => true,
+            [flag] if flag == "--help" || flag == "-h" => {
+                writeln!(io::stdout(), "Usage: wraith doctor [--json]\nChecks the environment and traces an owned harmless child; changes no host security policy.")?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            _ => {
+                return Err(bad(
+                    "Usage: wraith doctor [--json]; no target or enforcement flags are accepted",
+                ))
+            }
+        };
+        let report = wraith::doctor::inspect();
+        writeln!(
+            io::stdout(),
+            "{}",
+            if json {
+                report.to_json()
+            } else {
+                report.to_text()
+            }
+        )?;
+        return Ok(if report.ready() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
     }
 
     let mode = args[0].clone();
@@ -104,6 +138,24 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
                 opts.min = parse_sev(v)?;
             }
             "--jit-critical" => opts.cfg.jit_is_critical = true,
+            "--correlation-window" => {
+                i += 1;
+                let value = rest
+                    .get(i)
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| (1..=1_000_000).contains(value))
+                    .ok_or_else(|| bad("correlation window must be 1..=1000000 syscall entries"))?;
+                opts.cfg.correlation_window = value;
+            }
+            "--max-history" => {
+                i += 1;
+                let value = rest
+                    .get(i)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| *value <= 10_000)
+                    .ok_or_else(|| bad("history limit must be 0..=10000 retired process rows"))?;
+                opts.cfg.max_retired_processes = value;
+            }
             "--trust-region" => {
                 i += 1;
                 let v = rest
@@ -166,7 +218,11 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         // Append rather than truncate: a JSONL evidence log must never lose prior
         // detections just because the sensor is re-run against the same file.
         Some(path) => Some(Box::new(
-            OpenOptions::new().create(true).append(true).open(path)?,
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)?,
         )),
     };
     let min = opts.min;
@@ -312,13 +368,20 @@ fn run(args: Vec<String>) -> io::Result<ExitCode> {
         "wraith: {} syscalls, {} event(s); verdict: {}",
         summary.syscalls_seen,
         summary.events,
-        verdict(summary.max_severity),
+        if summary.coverage_gaps > 0 {
+            "INCOMPLETE COVERAGE"
+        } else {
+            verdict(summary.max_severity)
+        },
     );
 
     if let Some(code) = summary.exit_code {
         eprintln!("wraith: target exit: {code}");
     } else if let Some(signal) = summary.term_signal {
         eprintln!("wraith: target signal: {signal}");
+    }
+    if summary.coverage_gaps > 0 {
+        return Err(io::Error::other(format!("incomplete provenance coverage: {} failed mapping decision(s); do not treat this run as clean", summary.coverage_gaps)));
     }
     if output_failed {
         return Err(io::Error::other(
@@ -464,12 +527,15 @@ fn print_help() {
 USAGE:\n  \
 wraith run [OPTIONS] -- <program> [args...]   spawn and monitor a program\n  \
 wraith attach [OPTIONS] <pid>                 monitor one running process\n  \
-wraith scan [OPTIONS] (--match <s> | --all)   monitor many running processes\n\n\
+wraith scan [OPTIONS] (--match <s> | --all)   monitor many running processes\n  \
+wraith doctor [--json]                      probe owned-child monitoring readiness\n\n\
 OPTIONS:\n  \
 --json <FILE|->      also write JSONL events (`-` = stdout; a FILE is appended, not truncated)\n  \
 --min <SEV>          minimum severity to report: info|warn|high|critical (default: warn)\n  \
 --jit-critical       treat anonymous-exec origins as HIGH (targets that never JIT)\n  \
 --trust-region A-B    treat the hex range [A,B) as legitimate JIT (repeatable)\n  \
+--correlation-window N  evidence budget in syscall entries (default 64; also expires at 30s)\n  \
+--max-history N      retained dead-process rows (default 128; 0 disables history)\n  \
 --block              neutralise the offending syscall on exploitation (CRITICAL)\n  \
 --kill               SIGKILL the traced tree on exploitation (CRITICAL)\n  \
 --match <substr>     (scan) attach to processes whose name/cmdline matches (repeatable)\n  \
@@ -488,10 +554,10 @@ chain): --block cancels that syscall in place; --kill terminates the tree.\n\n\
 SCAN:\n  \
 `scan` attaches to a set of already-running processes at once. It needs\n  \
 CAP_SYS_PTRACE (or ownership of the targets) and adds two stops per syscall to\n  \
-each, so favour --match over --all on a busy host. Stopping wraith leaves the\n  \
-scanned processes running.\n\n\
+each, so favour --match over --all on a busy host. Observe-only teardown detaches\n  \
+targets; enforcement and fail-closed cleanup can terminate them.\n\n\
 EXIT CODES:\n  \
-0 clean/minor · 1 suspicious (HIGH) · 3 exploitation (CRITICAL) · 2 usage error\n"
+0 clean/minor · 1 suspicious (HIGH) · 3 critical policy verdict · 2 operational/usage/coverage error\n"
     );
 }
 

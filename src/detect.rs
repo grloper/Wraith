@@ -7,6 +7,7 @@
 //! one process they are an exploitation chain, and Wraith says so explicitly.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::event::{Event, Kind, Severity};
 use crate::maps::MemoryMap;
@@ -54,6 +55,11 @@ pub struct Config {
     /// Whether (and how) to actively stop confirmed exploitation. See
     /// [`Enforcement`].
     pub enforcement: Enforcement,
+    /// Maximum intervening syscall entries for coarse correlation evidence.
+    /// A fixed 30-second monotonic TTL also bounds idle evidence.
+    pub correlation_window: u64,
+    /// Retained exited process rows; live rows are never evicted to meet this cap.
+    pub max_retired_processes: usize,
 }
 
 impl Default for Config {
@@ -64,6 +70,8 @@ impl Default for Config {
             audit_sensitive: false,
             trusted_regions: Vec::new(),
             enforcement: Enforcement::Observe,
+            correlation_window: 64,
+            max_retired_processes: 128,
         }
     }
 }
@@ -100,7 +108,7 @@ impl Config {
 }
 
 /// Register/argument snapshot at a syscall-entry stop.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyscallCtx {
     pub pid: i32,
     pub nr: u64,
@@ -110,21 +118,94 @@ pub struct SyscallCtx {
     pub args: [u64; 6],
 }
 
-/// Accumulated evidence for a single traced process.
+/// Evidence is bounded by syscall progress and monotonic time, not wall-clock
+/// timestamps. It remains a coarse observation, not a causal taint graph.
+#[derive(Debug, Clone, Copy)]
+struct Evidence {
+    sequence: u64,
+    at: Instant,
+}
+
+impl Evidence {
+    fn recent(self, sequence: u64, now: Instant, budget: u64) -> bool {
+        sequence.saturating_sub(self.sequence) <= budget
+            && now
+                .checked_duration_since(self.at)
+                .is_some_and(|age| age <= Duration::from_secs(30))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemorySpan {
+    start: u64,
+    end: u64,
+}
+
+impl MemorySpan {
+    fn new(start: u64, len: u64) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let end = start.checked_add(len)?.checked_add(4095)? & !4095;
+        Some(Self {
+            start: start & !4095,
+            end,
+        })
+    }
+    fn contains(self, address: u64) -> bool {
+        address >= self.start && address < self.end
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemoryEvidence {
+    span: MemorySpan,
+    timing: Evidence,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ChainState {
-    net_input: bool,
-    wx_staged: bool,
-    foreign_origin: bool,
-    stack_pivot: bool,
+    sequence: u64,
+    net_input: Option<Evidence>,
+    wx_staged: Option<MemoryEvidence>,
+    stack_pivot: Option<Evidence>,
     chain_reported: bool,
 }
 
 impl ChainState {
-    /// Distinct staging milestones observed so far.
-    fn staging_count(&self) -> u32 {
-        self.net_input as u32 + self.wx_staged as u32 + self.stack_pivot as u32
+    fn expire(&mut self, now: Instant, budget: u64) {
+        if self
+            .net_input
+            .is_some_and(|e| !e.recent(self.sequence, now, budget))
+        {
+            self.net_input = None;
+        }
+        if self
+            .wx_staged
+            .is_some_and(|e| !e.timing.recent(self.sequence, now, budget))
+        {
+            self.wx_staged = None;
+        }
+        if self
+            .stack_pivot
+            .is_some_and(|e| !e.recent(self.sequence, now, budget))
+        {
+            self.stack_pivot = None;
+        }
     }
+    fn staging_count(&self, origin: u64) -> u32 {
+        self.net_input.is_some() as u32
+            + self.wx_staged.is_some_and(|e| e.span.contains(origin)) as u32
+            + self.stack_pivot.is_some() as u32
+    }
+}
+
+#[derive(Debug)]
+struct PendingCompletion {
+    proc_key: i32,
+    ctx: SyscallCtx,
+    input: bool,
+    wx_span: Option<MemorySpan>,
 }
 
 pub struct Detector {
@@ -134,6 +215,10 @@ pub struct Detector {
     /// thread and fired from another is a single chain; separate processes get
     /// separate chains so their evidence never bleeds together.
     chains: HashMap<i32, ChainState>,
+    /// At most one completion candidate per active TID, removed at exit/death.
+    pending: HashMap<i32, PendingCompletion>,
+    /// Exact kernel-registered alternate-stack extent per observed active TID.
+    alt_stacks: HashMap<i32, (i32, MemorySpan)>,
 }
 
 impl Detector {
@@ -141,6 +226,8 @@ impl Detector {
         Detector {
             cfg,
             chains: HashMap::new(),
+            pending: HashMap::new(),
+            alt_stacks: HashMap::new(),
         }
     }
 
@@ -149,27 +236,41 @@ impl Detector {
     /// thread-group id); all threads sharing memory pass the same key so their
     /// evidence correlates into one exploitation chain.
     pub fn on_syscall(&mut self, proc_key: i32, ctx: &SyscallCtx, map: &MemoryMap) -> Vec<Event> {
+        self.on_syscall_at(proc_key, ctx, map, Instant::now())
+    }
+
+    fn on_syscall_at(
+        &mut self,
+        proc_key: i32,
+        ctx: &SyscallCtx,
+        map: &MemoryMap,
+        now: Instant,
+    ) -> Vec<Event> {
         let mut events = Vec::new();
+        self.pending.remove(&ctx.pid);
+        let mut requested_wx_span = None;
         // Resolve display names only when a rule emits an event; unknown
         // syscall names allocate, so quiet hot-path calls should not format them.
         // Disjoint field borrows: `cfg` is read-only, `chain` is the mutable
         // per-process accumulator for this address space.
+        let enrolled_stack = self
+            .alt_stacks
+            .get(&ctx.pid)
+            .is_some_and(|(group, span)| *group == proc_key && span.contains(ctx.rsp));
         let cfg = &self.cfg;
         let chain = self.chains.entry(proc_key).or_default();
+        chain.sequence = chain.sequence.saturating_add(1);
+        chain.expire(now, cfg.correlation_window);
 
         // Breadcrumb: first-stage payloads usually arrive over a read/recv.
         // A bare `read` is only interesting when it comes from stdin (fd 0);
         // reads on other fds are just the loader/program doing routine I/O.
         // `recvfrom`/`recvmsg` operate on sockets, so they always count.
-        if syscalls::is_network_input(ctx.nr) {
-            let is_external_input = match ctx.nr {
+        let is_external_input = syscalls::is_network_input(ctx.nr)
+            && match ctx.nr {
                 0 | 19 => ctx.args[0] == 0, // read/readv from stdin
                 _ => true,                  // recvfrom/recvmsg
             };
-            if is_external_input {
-                chain.net_input = true;
-            }
-        }
 
         // 1. Provenance of the syscall instruction itself. A trusted JIT
         //    region is exempt: the operator has vouched that runtime-generated
@@ -181,7 +282,6 @@ impl Detector {
         let trusted_origin = cfg.is_trusted(ctx.rip);
         if origin.is_anomalous() && !trusted_origin {
             let sysname = syscalls::name(ctx.nr);
-            chain.foreign_origin |= confirmed_origin;
             let sensitive = syscalls::is_sensitive(ctx.nr);
             let severity = foreign_severity(cfg, origin, sensitive);
             let label = map
@@ -232,11 +332,14 @@ impl Detector {
         }
 
         // 2. Stack pivot: the stack pointer is somewhere no real stack lives.
-        if cfg.detect_stack_pivot {
+        if cfg.detect_stack_pivot && !enrolled_stack {
             let ss = classify_rsp(map, ctx.rsp);
             if ss.is_anomalous() && ss != StackState::Unmapped {
                 let sysname = syscalls::name(ctx.nr);
-                chain.stack_pivot = true;
+                chain.stack_pivot = Some(Evidence {
+                    sequence: chain.sequence,
+                    at: now,
+                });
                 let label = map
                     .region_at(ctx.rsp)
                     .map(|r| r.label())
@@ -275,7 +378,7 @@ impl Detector {
                 // Operator-vouched JIT page; not payload staging.
             } else if prot.is_wx() {
                 let sysname = syscalls::name(ctx.nr);
-                chain.wx_staged = true;
+                requested_wx_span = MemorySpan::new(addr, ctx.args[1]);
                 events.push(Event::now(
                     ctx.pid,
                     Severity::High,
@@ -297,7 +400,7 @@ impl Detector {
                 if ctx.args[1] != 0 {
                     if let Some(region) = writable {
                         let sysname = syscalls::name(ctx.nr);
-                        chain.wx_staged = true;
+                        requested_wx_span = MemorySpan::new(addr, ctx.args[1]);
                         events.push(Event::now(
                             ctx.pid,
                             if cfg.jit_is_critical { Severity::High } else { Severity::Warn },
@@ -318,14 +421,13 @@ impl Detector {
         //    any prior staging milestone, is an exploitation chain — one high
         //    confidence verdict rather than a scatter of primitives.
         if !chain.chain_reported
-            && chain.foreign_origin
             && syscalls::is_sensitive(ctx.nr)
             && confirmed_origin
             && !trusted_origin
-            && chain.staging_count() >= 1
+            && chain.staging_count(ctx.rip) >= 1
         {
             chain.chain_reported = true;
-            let narrative = chain_narrative(chain);
+            let narrative = chain_narrative(chain, ctx.rip);
             let sysname = syscalls::name(ctx.nr);
             events.push(Event::now(
                 ctx.pid,
@@ -339,7 +441,79 @@ impl Detector {
             ));
         }
 
+        if is_external_input || requested_wx_span.is_some() {
+            self.pending.insert(
+                ctx.pid,
+                PendingCompletion {
+                    proc_key,
+                    ctx: *ctx,
+                    input: is_external_input,
+                    wx_span: requested_wx_span,
+                },
+            );
+        }
         events
+    }
+
+    /// Record only confirmed completion outcomes. Primitive request alerts stay
+    /// at entry; failed/blocked calls and empty input cannot stage a chain.
+    pub fn on_syscall_exit(&mut self, proc_key: i32, ctx: &SyscallCtx, result: i64) {
+        let Some(pending) = self.pending.remove(&ctx.pid) else {
+            return;
+        };
+        if pending.proc_key != proc_key || pending.ctx != *ctx || result < 0 {
+            return;
+        }
+        let chain = self.chains.entry(proc_key).or_default();
+        let timing = Evidence {
+            sequence: chain.sequence,
+            at: Instant::now(),
+        };
+        if pending.input && result > 0 {
+            chain.net_input = Some(timing);
+        }
+        if let Some(requested) = pending.wx_span {
+            let span = if syscalls::is_mmap(ctx.nr) {
+                MemorySpan::new(result as u64, ctx.args[1])
+            } else if result == 0 {
+                Some(requested)
+            } else {
+                None
+            };
+            if let Some(span) = span {
+                let huge = syscalls::is_mmap(ctx.nr) && ctx.args[3] & libc::MAP_HUGETLB as u64 != 0;
+                if huge || !self.cfg.is_trusted_range(span.start, span.end - span.start) {
+                    chain.wx_staged = Some(MemoryEvidence { span, timing });
+                }
+            }
+        }
+    }
+
+    /// Coverage loss invalidates correlation evidence, but not independently
+    /// captured kernel stack registration.
+    pub fn clear_evidence(&mut self, proc_key: i32) {
+        self.chains.remove(&proc_key);
+        self.pending
+            .retain(|_, pending| pending.proc_key != proc_key);
+    }
+
+    /// Called only after a successful native sigaltstack completion. Enrollment
+    /// exempts RSP within this exact extent, never instruction origin or all heap.
+    pub fn register_altstack(&mut self, pid: i32, proc_key: i32, start: u64, len: u64, flags: u64) {
+        // A successful replacement supersedes old metadata even when the new
+        // extent is disabled, empty, or cannot be represented without overflow.
+        self.alt_stacks.remove(&pid);
+        if flags & libc::SS_DISABLE as u64 == 0 && len > 0 {
+            if let Some(end) = start.checked_add(len) {
+                self.alt_stacks
+                    .insert(pid, (proc_key, MemorySpan { start, end }));
+            }
+        }
+    }
+
+    pub fn retire_thread(&mut self, pid: i32) {
+        self.pending.remove(&pid);
+        self.alt_stacks.remove(&pid);
     }
 
     /// Forget all accumulated evidence for an address space whose last thread
@@ -347,7 +521,8 @@ impl Detector {
     /// the trace — a slow leak when following a long-lived target that forks or
     /// spawns many short-lived children. A recycled key simply starts fresh.
     pub fn retire(&mut self, proc_key: i32) {
-        self.chains.remove(&proc_key);
+        self.clear_evidence(proc_key);
+        self.alt_stacks.retain(|_, (group, _)| *group != proc_key);
     }
 }
 
@@ -372,15 +547,15 @@ fn foreign_severity(cfg: &Config, origin: Origin, sensitive: bool) -> Severity {
     }
 }
 
-fn chain_narrative(chain: &ChainState) -> String {
+fn chain_narrative(chain: &ChainState, origin: u64) -> String {
     let mut steps = Vec::new();
-    if chain.net_input {
-        steps.push("input syscall observed");
+    if chain.net_input.is_some() {
+        steps.push("positive input syscall completed");
     }
-    if chain.wx_staged {
-        steps.push("executable-memory staging request observed (W^X)");
+    if chain.wx_staged.is_some_and(|e| e.span.contains(origin)) {
+        steps.push("executable-memory staging completed in the observed address span");
     }
-    if chain.stack_pivot {
+    if chain.stack_pivot.is_some() {
         steps.push("stack pivot");
     }
     steps.push("sensitive syscall from anomalous executable memory");
@@ -413,6 +588,108 @@ mod tests {
             rsp,
             args,
         }
+    }
+
+    #[test]
+    fn failed_or_empty_calls_do_not_become_chain_milestones() {
+        let m = MemoryMap::parse(&format!("{MAP}\n7f0000060000-7f0000061000 r-xp 0 00:00 0"));
+        for (nr, args, result) in [
+            (
+                10,
+                [0x7f0000060000, 0x1000, 7, 0, 0, 0],
+                -(libc::ENOMEM as i64),
+            ),
+            (45, [u64::MAX, 0, 32, 0, 0, 0], -(libc::EBADF as i64)),
+            (0, [0; 6], 0),
+        ] {
+            let mut detector = Detector::new(Config {
+                jit_is_critical: true,
+                ..Config::default()
+            });
+            let request = ctx(nr, 0x7f0000000500, 0x7ffd00010000, args);
+            detector.on_syscall(1, &request, &m);
+            detector.on_syscall_exit(1, &request, result);
+            let events =
+                detector.on_syscall(1, &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event.kind == Kind::ExploitationChain),
+                "{events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_evidence_is_recent_and_allocation_scoped() {
+        let m = MemoryMap::parse(&format!("{MAP}\n7f0000060000-7f0000061000 r-xp 0 00:00 0"));
+        let mut detector = Detector::new(Config {
+            jit_is_critical: true,
+            ..Config::default()
+        });
+        let input = ctx(0, 0x7f0000000500, 0x7ffd00010000, [0; 6]);
+        detector.on_syscall(1, &input, &m);
+        detector.on_syscall_exit(1, &input, 12);
+        for _ in 0..100 {
+            detector.on_syscall(1, &ctx(39, 0x7f0000000500, 0x7ffd00010000, [0; 6]), &m);
+        }
+        let events = detector.on_syscall(1, &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == Kind::ExploitationChain));
+
+        let mut detector = Detector::new(Config {
+            jit_is_critical: true,
+            ..Config::default()
+        });
+        let stage = ctx(
+            10,
+            0x7f0000000500,
+            0x7ffd00010000,
+            [0x7f0000050000, 4096, 7, 0, 0, 0],
+        );
+        detector.on_syscall(1, &stage, &m);
+        detector.on_syscall_exit(1, &stage, 0);
+        let events = detector.on_syscall(1, &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]), &m);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == Kind::ExploitationChain),
+            "unrelated executable allocation inherited staging"
+        );
+        let changed = MemoryMap::parse(&MAP.replace(
+            "7f0000050000-7f0000051000 rw-p",
+            "7f0000050000-7f0000051000 rwxp",
+        ));
+        let events = detector.on_syscall(
+            1,
+            &ctx(41, 0x7f0000050010, 0x7ffd00010000, [0; 6]),
+            &changed,
+        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == Kind::ExploitationChain));
+    }
+
+    #[test]
+    fn evidence_expires_with_idle_monotonic_time_without_sleeping() {
+        let mut detector = Detector::new(Config {
+            jit_is_critical: true,
+            ..Config::default()
+        });
+        let m = MemoryMap::parse(&format!("{MAP}\n7f0000060000-7f0000061000 r-xp 0 00:00 0"));
+        let input = ctx(0, 0x7f0000000500, 0x7ffd00010000, [0; 6]);
+        detector.on_syscall(1, &input, &m);
+        detector.on_syscall_exit(1, &input, 1);
+        let events = detector.on_syscall_at(
+            1,
+            &ctx(41, 0x7f0000060010, 0x7ffd00010000, [0; 6]),
+            &m,
+            std::time::Instant::now() + std::time::Duration::from_secs(31),
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.kind == Kind::ExploitationChain));
     }
 
     #[test]
@@ -739,6 +1016,62 @@ mod tests {
     }
 
     #[test]
+    fn enrolled_stack_is_thread_local_rsp_only_and_disableable() {
+        let mut detector = Detector::new(Config::default());
+        detector.register_altstack(1, 1, 0x55f000002000, 0x4000, 0);
+        let normal = ctx(1, 0x7f0000000500, 0x55f000004000, [0; 6]);
+        assert!(!detector
+            .on_syscall(1, &normal, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+        let mut other = normal;
+        other.pid = 2;
+        assert!(detector
+            .on_syscall(1, &other, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+        let outside = ctx(1, 0x7f0000000500, 0x55f000008000, [0; 6]);
+        assert!(detector
+            .on_syscall(1, &outside, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+        let injected = ctx(59, 0x7f0000030010, 0x55f000004000, [0; 6]);
+        assert!(detector
+            .on_syscall(1, &injected, &map())
+            .iter()
+            .any(|e| e.kind == Kind::ForeignOriginSyscall));
+        detector.register_altstack(1, 1, 0, 0, libc::SS_DISABLE as u64);
+        assert!(detector
+            .on_syscall(1, &normal, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+    }
+
+    #[test]
+    fn stack_registration_rejects_overflow_and_retires_with_lifecycle() {
+        let mut detector = Detector::new(Config::default());
+        let normal = ctx(1, 0x7f0000000500, 0x55f000004000, [0; 6]);
+        detector.register_altstack(1, 1, 0x55f000002000, 0x4000, 0);
+        detector.register_altstack(1, 1, u64::MAX - 32, 65536, 0);
+        assert!(detector
+            .on_syscall(1, &normal, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+        detector.register_altstack(1, 1, 0x55f000002000, 0x4000, 0);
+        detector.retire_thread(1);
+        assert!(detector
+            .on_syscall(1, &normal, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+        detector.register_altstack(1, 1, 0x55f000002000, 0x4000, 0);
+        detector.retire(1);
+        assert!(detector
+            .on_syscall(1, &normal, &map())
+            .iter()
+            .any(|e| e.kind == Kind::StackPivot));
+    }
+
+    #[test]
     fn stack_pivot_into_heap_detected() {
         let mut d = Detector::new(Config::default());
         let ev = d.on_syscall(1, &ctx(1, 0x7f0000000500, 0x55f000004000, [0; 6]), &map());
@@ -748,23 +1081,25 @@ mod tests {
     #[test]
     fn exploitation_chain_correlates() {
         let mut d = Detector::new(Config::default());
-        // Step 1: stage RWX via mprotect (from legit code).
+        // Step 1: successfully stage the same allocation later executing.
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(
-            1,
-            &ctx(
-                10,
-                0x7f0000000500,
-                0x7ffd00010000,
-                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
-            ),
-            &map(),
+        let request = ctx(
+            10,
+            0x7f0000000500,
+            0x7ffd00010000,
+            [0x7f0000030000, 0x1000, prot, 0, 0, 0],
         );
+        d.on_syscall(1, &request, &map());
+        d.on_syscall_exit(1, &request, 0);
         // Step 2: execve from the injected RWX page.
         let ev = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
-        assert!(ev
+        let chain = ev
             .iter()
-            .any(|e| e.kind == Kind::ExploitationChain && e.severity == Severity::Critical));
+            .find(|event| event.kind == Kind::ExploitationChain)
+            .unwrap();
+        assert_eq!(chain.severity, Severity::Critical);
+        assert!(chain.detail.contains("observed address span"));
+        assert!(!chain.detail.contains("this allocation"));
     }
 
     #[test]
@@ -831,16 +1166,14 @@ mod tests {
     fn chain_reported_only_once() {
         let mut d = Detector::new(Config::default());
         let prot = (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) as u64;
-        d.on_syscall(
-            1,
-            &ctx(
-                10,
-                0x7f0000000500,
-                0x7ffd00010000,
-                [0x7f0000050000, 0x1000, prot, 0, 0, 0],
-            ),
-            &map(),
+        let request = ctx(
+            10,
+            0x7f0000000500,
+            0x7ffd00010000,
+            [0x7f0000030000, 0x1000, prot, 0, 0, 0],
         );
+        d.on_syscall(1, &request, &map());
+        d.on_syscall_exit(1, &request, 0);
         let first = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         let second = d.on_syscall(1, &ctx(59, 0x7f0000030010, 0x7ffd00010000, [0; 6]), &map());
         assert!(first.iter().any(|e| e.kind == Kind::ExploitationChain));

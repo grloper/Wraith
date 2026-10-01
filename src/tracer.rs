@@ -47,8 +47,37 @@ pub use crate::engine::{ProcStat, Reporter, Summary};
 
 /// The kernel identifies entry/exit stops; only in-flight map changes are local.
 struct ThreadState {
-    memory_op: bool,
+    /// Exactly one original entry per active TID. An unmatched initial attach
+    /// exit is ignored rather than inventing a completion candidate.
+    pending: Option<PendingSyscall>,
     tgid: i32,
+    last_signal: Option<(Signal, u64, u64)>,
+    /// Deduplication is carried only by this group's remaining live threads.
+    fatal_reported: bool,
+}
+
+struct PendingSyscall {
+    entry: SyscallEntry,
+    altstack: Option<AltStack>,
+}
+
+struct AltStack {
+    start: u64,
+    size: u64,
+    flags: u64,
+}
+
+fn capture_altstack(pid: Pid, address: u64) -> Option<AltStack> {
+    if address == 0 {
+        return None;
+    }
+    // Native x86-64 stack_t is pointer, int flags + padding, size_t (24 bytes).
+    // The tracee is stopped; no arbitrary host dereference is performed.
+    let start = ptrace::read(pid, address as ptrace::AddressType).ok()? as u64;
+    let flags = ptrace::read(pid, address.checked_add(8)? as ptrace::AddressType).ok()? as u64
+        & 0xffff_ffff;
+    let size = ptrace::read(pid, address.checked_add(16)? as ptrace::AddressType).ok()? as u64;
+    Some(AltStack { start, size, flags })
 }
 
 /// Linux's ptrace_syscall_info ABI (including the largest, seccomp union arm).
@@ -65,7 +94,7 @@ struct SyscallInfo {
 
 enum SyscallStop {
     Entry(SyscallEntry),
-    Exit,
+    Exit { result: i64, is_error: bool },
 }
 
 fn syscall_stop(pid: Pid) -> io::Result<SyscallStop> {
@@ -102,7 +131,10 @@ fn decode_syscall_info(info: &SyscallInfo, size: i64) -> io::Result<SyscallStop>
             rsp: info.sp,
             args: info.data[1..7].try_into().expect("six syscall arguments"),
         })),
-        2 if size >= 33 => Ok(SyscallStop::Exit),
+        2 if size >= 33 => Ok(SyscallStop::Exit {
+            result: info.data[0] as i64,
+            is_error: info.data[1] & 0xff != 0,
+        }),
         _ => Err(io::Error::other(
             "kernel did not identify the syscall entry/exit stop",
         )),
@@ -350,8 +382,8 @@ impl Tracer {
         Ok(())
     }
 
-    /// Surface a fatal memory-safety signal as a possible failed exploit.
-    /// Returns whether an event was emitted (so the caller can force a repaint).
+    /// A delivery stop does not establish termination: handlers and runtimes
+    /// may intentionally catch these signals. Return bounded advisory context.
     fn on_signal(
         &self,
         pid: Pid,
@@ -359,32 +391,33 @@ impl Tracer {
         sig: Signal,
         engine: &mut Engine,
         reporter: &mut dyn Reporter,
-    ) -> bool {
-        let fatal = matches!(
-            sig,
-            Signal::SIGSEGV | Signal::SIGILL | Signal::SIGBUS | Signal::SIGABRT
-        );
-        if !fatal {
-            return false;
+    ) -> Option<(u64, u64)> {
+        if !diagnostic_signal(sig) {
+            return None;
         }
         let (rip, rsp) = ptrace::getregs(pid)
             .map(|r| (r.rip, r.rsp))
             .unwrap_or((0, 0));
         let ev = Event::now(
             pid.as_raw(),
-            Severity::High,
-            Kind::Crash,
+            Severity::Info,
+            Kind::SignalDelivery,
             format!("signal:{sig:?}"),
             rip,
             rsp,
-            "fault",
-            format!(
-                "target received {sig:?} — memory-corruption fault; possible failed exploitation attempt"
-            ),
+            "signal-delivery",
+            format!("{sig:?} delivery observed; handler and termination outcome are unknown"),
         );
         engine.record_event(tgid, &ev, reporter);
-        true
+        Some((rip, rsp))
     }
+}
+
+fn diagnostic_signal(sig: Signal) -> bool {
+    matches!(
+        sig,
+        Signal::SIGSEGV | Signal::SIGILL | Signal::SIGBUS | Signal::SIGABRT | Signal::SIGFPE
+    )
 }
 
 impl Drop for Tracer {
@@ -463,7 +496,9 @@ impl Backend for Tracer {
             threads.insert(
                 raw,
                 ThreadState {
-                    memory_op: false,
+                    pending: None,
+                    last_signal: None,
+                    fatal_reported: false,
                     tgid,
                 },
             );
@@ -521,7 +556,9 @@ impl Backend for Tracer {
                 cleanup.tids.insert(who);
                 let tgid = read_tgid(raw);
                 slot.insert(ThreadState {
-                    memory_op: false,
+                    pending: None,
+                    last_signal: None,
+                    fatal_reported: false,
                     tgid,
                 });
                 engine.register_space(tgid);
@@ -537,6 +574,7 @@ impl Backend for Tracer {
                     let tgid = threads.get(&raw).map(|t| t.tgid);
                     threads.remove(&raw);
                     cleanup.tids.remove(&who);
+                    engine.on_thread_exit(raw);
                     if Some(raw) == root_pid {
                         engine.set_exit_code(code);
                     }
@@ -547,9 +585,39 @@ impl Backend for Tracer {
                     }
                 }
                 WaitStatus::Signaled(_, sig, _) => {
-                    let tgid = threads.get(&raw).map(|t| t.tgid);
-                    threads.remove(&raw);
+                    let thread = threads.remove(&raw);
+                    let tgid = thread.as_ref().map(|state| state.tgid);
+                    if diagnostic_signal(sig)
+                        && thread.as_ref().is_some_and(|state| !state.fatal_reported)
+                    {
+                        let group = tgid.unwrap_or(raw);
+                        let context = thread
+                            .as_ref()
+                            .and_then(|state| state.last_signal)
+                            .filter(|(delivered, _, _)| *delivered == sig);
+                        let (rip, rsp) = context.map(|(_, rip, rsp)| (rip, rsp)).unwrap_or((0, 0));
+                        let detail = if context.is_some() {
+                            format!("target terminated by {sig:?}; cause unknown; registers are cached delivery context, not a proven fault origin")
+                        } else {
+                            format!("target terminated by {sig:?}; cause unknown; register context unavailable")
+                        };
+                        let event = Event::now(
+                            raw,
+                            Severity::High,
+                            Kind::Crash,
+                            format!("signal:{sig:?}"),
+                            rip,
+                            rsp,
+                            "terminal-signal",
+                            detail,
+                        );
+                        engine.record_event(group, &event, reporter);
+                        for state in threads.values_mut().filter(|state| state.tgid == group) {
+                            state.fatal_reported = true;
+                        }
+                    }
                     cleanup.tids.remove(&who);
+                    engine.on_thread_exit(raw);
                     if Some(raw) == root_pid {
                         engine.set_term_signal(sig as i32);
                     }
@@ -577,7 +645,12 @@ impl Backend for Tracer {
                         SyscallStop::Entry(entry) => {
                             engine.count_syscall(tgid);
                             if let Some(ts) = threads.get_mut(&raw) {
-                                ts.memory_op = syscalls::is_memory_op(entry.nr);
+                                let altstack = if entry.nr == 131 && entry.args[0] != 0 {
+                                    capture_altstack(who, entry.args[0])
+                                } else {
+                                    None
+                                };
+                                ts.pending = Some(PendingSyscall { entry, altstack });
                             }
                             let step = engine.inspect(raw, tgid, &entry, reporter);
                             event_fired = step.event_fired;
@@ -606,12 +679,31 @@ impl Backend for Tracer {
                                 Action::Proceed => {}
                             }
                         }
-                        SyscallStop::Exit => {
-                            if let Some(ts) = threads.get_mut(&raw) {
-                                if ts.memory_op {
-                                    engine.invalidate_maps(tgid);
+                        SyscallStop::Exit { result, is_error } => {
+                            if let Some(pending) =
+                                threads.get_mut(&raw).and_then(|ts| ts.pending.take())
+                            {
+                                if is_error && result >= 0 {
+                                    return Err(io::Error::other(
+                                        "inconsistent kernel syscall exit result",
+                                    ));
                                 }
-                                ts.memory_op = false;
+                                engine.on_syscall_exit(raw, tgid, &pending.entry, result);
+                                if pending.entry.nr == 131
+                                    && pending.entry.args[0] != 0
+                                    && !is_error
+                                    && result == 0
+                                {
+                                    let registration = pending.altstack.ok_or_else(|| io::Error::other(
+                                        "successful sigaltstack metadata unavailable; stack-policy coverage incomplete"))?;
+                                    engine.register_altstack(
+                                        raw,
+                                        tgid,
+                                        registration.start,
+                                        registration.size,
+                                        registration.flags,
+                                    );
+                                }
                             }
                         }
                     }
@@ -643,17 +735,21 @@ impl Backend for Tracer {
                             "job-control group stops are unsupported for launched targets; use a validated attach workflow",
                         ));
                     }
-                    // A real signal was delivered to the tracee (not a syscall
-                    // stop). Fatal memory-safety signals are worth surfacing as
-                    // a possible failed exploit, then we forward the signal.
+                    // Delivery is advisory, not a proven crash. Forward it so
+                    // the target's handler/default disposition decides outcome.
                     let Some(tgid) = threads.get(&raw).map(|t| t.tgid) else {
                         ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
                         continue;
                     };
                     engine.register_space(tgid);
-                    let fired = self.on_signal(who, tgid, sig, &mut engine, reporter);
+                    let context = self.on_signal(who, tgid, sig, &mut engine, reporter);
+                    if let Some((rip, rsp)) = context {
+                        if let Some(state) = threads.get_mut(&raw) {
+                            state.last_signal = Some((sig, rip, rsp));
+                        }
+                    }
                     ptrace::syscall(who, Some(sig)).map_err(nix_err)?;
-                    engine.refresh(reporter, &mut last_refresh, fired);
+                    engine.refresh(reporter, &mut last_refresh, context.is_some());
                 }
                 WaitStatus::PtraceEvent(_, sig, event) => {
                     if !cleanup.owned
@@ -683,7 +779,9 @@ impl Backend for Tracer {
                         threads.insert(
                             raw,
                             ThreadState {
-                                memory_op: false,
+                                pending: None,
+                                last_signal: None,
+                                fatal_reported: false,
                                 tgid,
                             },
                         );
@@ -790,7 +888,12 @@ fn attach_group(pid: i32) -> io::Result<Vec<Pid>> {
 
 fn wait_tracee(pid: Pid) -> io::Result<WaitStatus> {
     loop {
-        match waitpid(pid, Some(nix::sys::wait::WaitPidFlag::__WALL)) {
+        // ptrace ownership is per OS thread. __WALL includes cloned tracees;
+        // __WNOTHREAD prevents consuming a sibling thread's unrelated child or
+        // another independent tracer's status. Spawn/attach and drive on the
+        // same thread; arbitrary unrelated children on that thread are not safe.
+        let flags = nix::sys::wait::WaitPidFlag::__WALL | nix::sys::wait::WaitPidFlag::__WNOTHREAD;
+        match waitpid(pid, Some(flags)) {
             Err(nix::errno::Errno::EINTR) => continue,
             result => return result.map_err(nix_err),
         }
@@ -843,6 +946,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn syscall_exit_preserves_signed_result_and_kernel_error_bit() {
+        let mut info = SyscallInfo {
+            op: 2,
+            arch: 0xc000003e,
+            ..Default::default()
+        };
+        info.data[0] = (-9_i64) as u64;
+        info.data[1] = 1;
+        assert!(matches!(
+            decode_syscall_info(&info, 33),
+            Ok(SyscallStop::Exit {
+                result: -9,
+                is_error: true
+            })
+        ));
+        info.data[0] = 12;
+        info.data[1] = 0;
+        assert!(matches!(
+            decode_syscall_info(&info, 33),
+            Ok(SyscallStop::Exit {
+                result: 12,
+                is_error: false
+            })
+        ));
+    }
+
+    #[test]
     fn syscall_info_rejects_x32_despite_native_audit_arch() {
         let mut info = SyscallInfo {
             op: 1,
@@ -868,7 +998,7 @@ mod tests {
         info.op = 2;
         assert!(matches!(
             decode_syscall_info(&info, 33),
-            Ok(SyscallStop::Exit)
+            Ok(SyscallStop::Exit { .. })
         ));
         assert!(decode_syscall_info(&info, 32).is_err());
         info.arch = 0x40000003;

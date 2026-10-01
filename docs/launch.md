@@ -45,8 +45,10 @@ observable behavior, not a CVE exploitation success rate.
 ## Resume wording
 
 > Built a Linux x86-64 runtime security sensor in Rust using ptrace and syscall
-> provenance; implemented shared address-space detection, JSONL telemetry and
-> opt-in enforcement, with real-process regression tests and reproducible demos.
+> provenance; implemented bounded successful-outcome correlation, explicit coverage
+> loss, per-thread stack/lifecycle handling and opt-in enforcement. Added private
+> JSONL evidence, strict bounded triage, Debian packaging, real-process regressions
+> and independently reviewed workload measurements.
 
 Only add measured test counts, performance improvements or coverage percentages
 from the revision you actually shipped. Do not claim kernel-module/eBPF work:

@@ -12,5 +12,11 @@ cargo build --release --locked
 python3 scripts/check_docs.py
 python3 scripts/check_brand.py
 python3 scripts/test_brand.py
-bash -n demo.sh scripts/verify.sh scripts/package_release.sh .githooks/pre-commit
-printf '\nPASS: formatting, Clippy, strict tests, release build and documentation gates.\n'
+python3 scripts/test_report.py
+python3 scripts/test_workloads.py
+bash -n demo.sh scripts/verify.sh scripts/package_release.sh scripts/package_deb.sh scripts/test_deb.sh scripts/test_archive.sh .githooks/pre-commit
+# These artifact freshness tests temporarily replace/restore a default binary;
+# keep them sequential and never overlap them with performance measurements.
+bash scripts/test_deb.sh
+bash scripts/test_archive.sh
+printf '\nPASS: formatting, Clippy, strict tests, release build, bounded investigation workflows, package and documentation gates.\n'

@@ -1,0 +1,51 @@
+Wraith for Debian-family amd64 systems
+======================================
+
+The package installs the sensor at /usr/bin/wraith and the manual at
+/usr/share/man/man1/wraith.1.gz. It does not install simulator executables,
+a service, a system-wide tracing policy, setuid bits or file capabilities.
+
+Before use:
+
+    wraith --version
+    wraith doctor
+    wraith doctor --json
+    man wraith
+
+Doctor checks this machine's native platform, procfs and actual tracing of
+an owned child, and reports Yama policy separately. An unhealthy environment
+returns status 2 and a JSON ready:false report; that is a runtime prerequisite
+failure, not proof that dpkg failed to install the package.
+
+Start with an owned foreground process in observe mode:
+
+    wraith run -- /usr/bin/your-service --foreground
+    wraith run --json ./events.jsonl -- /usr/bin/your-service --foreground
+
+Attach and scan require the permissions already enforced by Linux. Review
+ownership, Yama policy, namespaces and conflicting tracers locally. The package
+never changes these settings. Do not grant broad capabilities merely to hide a
+permission error. Baseline legitimate execution before selecting --block or
+--kill. A verdict is a configured behavioral signal, not forensic proof.
+
+Supported execution is native Linux x86-64 (amd64), kernel 5.3 or newer with
+procfs and usable ptrace. 32-bit/x32 targets are not supported. Dependencies
+in the package control record are calculated from the actual ELF binary by
+dpkg-shlibdeps; the binary needs the listed libc/libgcc versions. Building on
+a newer distribution can raise those requirements. This package format is
+compatible with Debian/Kali package tooling, but it does not constitute a
+claim of official Debian/Kali archive inclusion or testing in every release.
+
+The repository's package test inspects and extracts the .deb into a temporary
+directory and executes its sensor over local controls. It does not install
+into the host package database. Run that test only over a trusted package built
+from this source: structural archive checks are not a sandbox for arbitrary
+executables. No Kali VM or real-host installation is implied by that evidence.
+
+Full threat model, detection limits and operator guidance:
+https://github.com/grloper/Wraith/blob/main/docs/threat-model.md
+https://github.com/grloper/Wraith/blob/main/docs/operations.md
+
+Upstream source and private security reporting guidance:
+https://github.com/grloper/Wraith
+https://github.com/grloper/Wraith/blob/main/SECURITY.md

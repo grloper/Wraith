@@ -9,11 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// How alarming an event is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
-    /// Context only — a sensitive syscall from a legitimate origin.
+    /// Context only — an audit breadcrumb or an unconfirmed signal delivery.
     Info,
     /// Worth a look — anonymous-exec origin, could be a JIT.
     Warn,
-    /// Almost certainly malicious in a non-JIT process.
+    /// Strong anomaly or confirmed diagnostic termination; cause may be benign.
     High,
     /// Exploitation. Injected code issuing syscalls, or a correlated chain.
     Critical,
@@ -43,10 +43,14 @@ pub enum Kind {
     StackPivot,
     /// A sensitive syscall from a legitimate origin (audit breadcrumb).
     SensitiveCall,
+    /// Current provenance could not be inspected; not evidence of exploitation.
+    CoverageGap,
     /// Multiple primitives correlated into a single exploitation verdict.
     ExploitationChain,
-    /// The target took a fatal signal (SIGSEGV/SIGILL/SIGBUS/SIGABRT) — often
-    /// the visible symptom of a memory-corruption attempt that missed.
+    /// A signal-delivery stop, which may be handled and does not prove a crash.
+    SignalDelivery,
+    /// Kernel-confirmed termination by a diagnostic signal. Cause is unknown;
+    /// this alone does not establish memory corruption or exploitation.
     Crash,
     /// Enforcement neutralised the offending syscall in place (`--block`): the
     /// kernel was told to skip it and return an error.
@@ -63,7 +67,9 @@ impl Kind {
             Kind::WxTransition => "wx_transition",
             Kind::StackPivot => "stack_pivot",
             Kind::SensitiveCall => "sensitive_call",
+            Kind::CoverageGap => "coverage_gap",
             Kind::ExploitationChain => "exploitation_chain",
+            Kind::SignalDelivery => "signal_delivery",
             Kind::Crash => "crash",
             Kind::Blocked => "blocked",
             Kind::Killed => "killed",
@@ -119,7 +125,8 @@ impl Event {
     /// A single JSON object on one line (JSONL-friendly).
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"ts_ns\":{},\"pid\":{},\"severity\":\"{}\",\"kind\":\"{}\",\"syscall\":\"{}\",\"rip\":\"{:#x}\",\"rsp\":\"{:#x}\",\"origin\":\"{}\",\"detail\":\"{}\"}}",
+            "{{\"schema_version\":2,\"sensor_version\":\"{}\",\"ts_ns\":{},\"pid\":{},\"severity\":\"{}\",\"kind\":\"{}\",\"syscall\":\"{}\",\"rip\":\"{:#x}\",\"rsp\":\"{:#x}\",\"origin\":\"{}\",\"detail\":\"{}\"}}",
+            env!("CARGO_PKG_VERSION"),
             self.ts_ns,
             self.pid,
             self.severity.as_str(),
@@ -154,7 +161,7 @@ impl Event {
             self.syscall,
             self.rip,
             sanitize_display(&self.origin),
-            self.detail,
+            sanitize_display(&self.detail),
         )
     }
 }
@@ -171,7 +178,7 @@ pub fn sanitize_display(s: &str) -> String {
 }
 
 /// Escape the characters that would break a JSON string literal.
-fn json_escape(s: &str) -> String {
+pub(crate) fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -190,6 +197,27 @@ fn json_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_identifies_schema_and_sensor_version_without_removing_fields() {
+        let event = Event::now(
+            1,
+            Severity::Warn,
+            Kind::SensitiveCall,
+            "read",
+            1,
+            2,
+            "app",
+            "audit",
+        );
+        let json = event.to_json();
+        assert!(json.contains("\"schema_version\":2"));
+        assert!(json.contains(&format!(
+            "\"sensor_version\":\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(json.contains("\"pid\":1") && json.contains("\"syscall\":\"read\""));
+    }
 
     #[test]
     fn json_is_wellformed_and_escaped() {
@@ -234,6 +262,27 @@ mod tests {
         assert!(l.contains("pid=7"));
         assert!(l.contains("wx_violation"));
         assert!(l.contains("mprotect"));
+    }
+
+    #[test]
+    fn human_details_cannot_inject_terminal_controls() {
+        let event = Event::now(
+            1,
+            Severity::Warn,
+            Kind::CoverageGap,
+            "read",
+            1,
+            2,
+            "app",
+            "bad\x1b[2J\nlabel",
+        );
+        let line = event.to_line(false);
+        assert!(!line.contains('\x1b') && !line.contains('\n'));
+        let json = event.to_json();
+        assert!(
+            json.contains("\\u001b") && json.contains("\\n"),
+            "JSON retains escaped forensic bytes"
+        );
     }
 
     #[test]

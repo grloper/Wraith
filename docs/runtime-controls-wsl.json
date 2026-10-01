@@ -1,0 +1,317 @@
+{
+  "artifact_schema_version": 1,
+  "controls": [
+    {
+      "availability": "available",
+      "baseline": {
+        "command": [
+          "/usr/bin/python3",
+          "$ROOT/scripts/benchmark_workloads.py",
+          "--worker",
+          "python",
+          "--operations",
+          "100000"
+        ],
+        "completion": {
+          "checksum": "3269676523",
+          "completed": 100000,
+          "operation_seconds": [],
+          "requested": 100000,
+          "workers": 4,
+          "workload": "python"
+        },
+        "event_counts": {},
+        "events": [],
+        "invalid_reasons": [],
+        "measurement_valid": true,
+        "no_reported_coverage_gaps": null,
+        "observation_qualification": "untraced baseline: sensor gap reporting is not applicable; outcomes do not prove complete coverage",
+        "operational_observation_ok": true,
+        "process_returncode": 0,
+        "raw_stderr": "",
+        "raw_stdout": "WRAITH_WORKLOAD_COMPLETE {\"workload\": \"python\", \"requested\": 100000, \"completed\": 100000, \"checksum\": \"3269676523\", \"operation_seconds\": [], \"workers\": 4}\n",
+        "sensor_exit_code": null,
+        "severity_counts": {},
+        "target_completion_verified": true,
+        "target_exit_code": 0,
+        "target_signal": null,
+        "timed_out": false,
+        "wall_seconds": 0.11522100100046373
+      },
+      "native_executable": "/usr/bin/python3.12",
+      "no_reported_coverage_gaps": true,
+      "observation_qualification": "status and absence of reported gaps do not prove complete coverage",
+      "operational_observation_ok": true,
+      "policy_interpretation": "none observed in this finite control",
+      "policy_review": {
+        "known_policy_signal_counts": {},
+        "qualification": "known memory-permission heuristic, not attested runtime/JIT causality; critical chains and all other origins remain unexplained by this harness",
+        "unexplained_signal_counts": {}
+      },
+      "runtime": "python",
+      "scope": "owned finite threaded/JIT-capable runtime computation, not a production corpus",
+      "target_completed_successfully": true,
+      "traced": {
+        "command": [
+          "$ROOT/target/release/wraith",
+          "run",
+          "--quiet",
+          "--json",
+          "-",
+          "--",
+          "/usr/bin/python3",
+          "$ROOT/scripts/benchmark_workloads.py",
+          "--worker",
+          "python",
+          "--operations",
+          "100000"
+        ],
+        "completion": {
+          "checksum": "3269676523",
+          "completed": 100000,
+          "operation_seconds": [],
+          "requested": 100000,
+          "workers": 4,
+          "workload": "python"
+        },
+        "event_counts": {},
+        "events": [],
+        "invalid_reasons": [],
+        "measurement_valid": true,
+        "no_reported_coverage_gaps": true,
+        "observation_qualification": "status and absence of reported gaps do not prove complete coverage",
+        "operational_observation_ok": true,
+        "process_returncode": 0,
+        "raw_stderr": "wraith: monitoring `/usr/bin/python3 /mnt/c/Users/ofekv/Desktop/repos/Wraith/scripts/benchmark_workloads.py --worker python --operations 100000` (provenance mode)\nWRAITH_WORKLOAD_COMPLETE {\"workload\": \"python\", \"requested\": 100000, \"completed\": 100000, \"checksum\": \"3269676523\", \"operation_seconds\": [], \"workers\": 4}\nwraith: 2208 syscalls, 0 event(s); verdict: clean\nwraith: target exit: 0\n",
+        "raw_stdout": "",
+        "sensor_exit_code": 0,
+        "severity_counts": {},
+        "target_completion_verified": true,
+        "target_exit_code": 0,
+        "target_signal": null,
+        "timed_out": false,
+        "wall_seconds": 0.3343453360002968
+      },
+      "version": {
+        "status": 0,
+        "text": "Python 3.12.3"
+      }
+    },
+    {
+      "availability": "unavailable",
+      "discovered_path": null,
+      "reason": "not found as a native Linux ELF on PATH; Windows executables/wrappers are not run",
+      "runtime": "node"
+    },
+    {
+      "availability": "available",
+      "baseline": {
+        "command": [
+          "/usr/bin/java",
+          "-Xms16m",
+          "-Xmx64m",
+          "/tmp/wraith-controls-66f0i0y9/WraithRuntimeControl.java"
+        ],
+        "completion": {
+          "checksum": "7905669822",
+          "completed": 100000,
+          "operation_seconds": [],
+          "requested": 100000,
+          "workload": "java"
+        },
+        "event_counts": {},
+        "events": [],
+        "invalid_reasons": [],
+        "measurement_valid": true,
+        "no_reported_coverage_gaps": null,
+        "observation_qualification": "untraced baseline: sensor gap reporting is not applicable; outcomes do not prove complete coverage",
+        "operational_observation_ok": true,
+        "process_returncode": 0,
+        "raw_stderr": "",
+        "raw_stdout": "WRAITH_WORKLOAD_COMPLETE {\"workload\":\"java\",\"requested\":100000,\"completed\":100000,\"checksum\":\"7905669822\",\"operation_seconds\":[]}\n",
+        "sensor_exit_code": null,
+        "severity_counts": {},
+        "target_completion_verified": true,
+        "target_exit_code": 0,
+        "target_signal": null,
+        "timed_out": false,
+        "wall_seconds": 0.31455591800022376
+      },
+      "native_executable": "/usr/lib/jvm/java-21-openjdk-amd64/bin/java",
+      "no_reported_coverage_gaps": true,
+      "observation_qualification": "status and absence of reported gaps do not prove complete coverage",
+      "operational_observation_ok": true,
+      "policy_interpretation": "benign-policy anomaly observed; review the preserved events, not proof of an attack",
+      "policy_review": {
+        "known_policy_signal_counts": {
+          "wx_violation": 4
+        },
+        "qualification": "known memory-permission heuristic, not attested runtime/JIT causality; critical chains and all other origins remain unexplained by this harness",
+        "unexplained_signal_counts": {}
+      },
+      "runtime": "java",
+      "scope": "owned finite threaded/JIT-capable runtime computation, not a production corpus",
+      "target_completed_successfully": true,
+      "traced": {
+        "command": [
+          "$ROOT/target/release/wraith",
+          "run",
+          "--quiet",
+          "--json",
+          "-",
+          "--",
+          "/usr/bin/java",
+          "-Xms16m",
+          "-Xmx64m",
+          "/tmp/wraith-controls-66f0i0y9/WraithRuntimeControl.java"
+        ],
+        "completion": {
+          "checksum": "7905669822",
+          "completed": 100000,
+          "operation_seconds": [],
+          "requested": 100000,
+          "workload": "java"
+        },
+        "event_counts": {
+          "wx_violation": 4
+        },
+        "events": [
+          {
+            "detail": "`mprotect` requests writable+executable memory \u2014 classic shellcode staging",
+            "kind": "wx_violation",
+            "origin": "0x7fd92f80f000",
+            "pid": 18807,
+            "rip": "0x7fd92f6edee9",
+            "rsp": "0x7fd92dcc9be8",
+            "schema_version": 2,
+            "sensor_version": "0.2.0",
+            "severity": "HIGH",
+            "syscall": "mprotect",
+            "ts_ns": 1790830881676675722
+          },
+          {
+            "detail": "`mmap` requests writable+executable memory \u2014 classic shellcode staging",
+            "kind": "wx_violation",
+            "origin": "0x7fd917ee4000",
+            "pid": 18807,
+            "rip": "0x7fd92f6ed5ea",
+            "rsp": "0x7fd92dcc9470",
+            "schema_version": 2,
+            "sensor_version": "0.2.0",
+            "severity": "HIGH",
+            "syscall": "mmap",
+            "ts_ns": 1790830881706924097
+          },
+          {
+            "detail": "`mmap` requests writable+executable memory \u2014 classic shellcode staging",
+            "kind": "wx_violation",
+            "origin": "0x7fd9109ad000",
+            "pid": 18807,
+            "rip": "0x7fd92f6ed5ea",
+            "rsp": "0x7fd92dcc9470",
+            "schema_version": 2,
+            "sensor_version": "0.2.0",
+            "severity": "HIGH",
+            "syscall": "mmap",
+            "ts_ns": 1790830881707436871
+          },
+          {
+            "detail": "`mmap` requests writable+executable memory \u2014 classic shellcode staging",
+            "kind": "wx_violation",
+            "origin": "0x7fd918476000",
+            "pid": 18807,
+            "rip": "0x7fd92f6ed5ea",
+            "rsp": "0x7fd92dcc9470",
+            "schema_version": 2,
+            "sensor_version": "0.2.0",
+            "severity": "HIGH",
+            "syscall": "mmap",
+            "ts_ns": 1790830881707939322
+          }
+        ],
+        "invalid_reasons": [],
+        "measurement_valid": true,
+        "no_reported_coverage_gaps": true,
+        "observation_qualification": "status and absence of reported gaps do not prove complete coverage",
+        "operational_observation_ok": true,
+        "process_returncode": 1,
+        "raw_stderr": "wraith: monitoring `/usr/bin/java -Xms16m -Xmx64m /tmp/wraith-controls-66f0i0y9/WraithRuntimeControl.java` (provenance mode)\nWRAITH_WORKLOAD_COMPLETE {\"workload\":\"java\",\"requested\":100000,\"completed\":100000,\"checksum\":\"7905669822\",\"operation_seconds\":[]}\nwraith: 9795 syscalls, 6 event(s); verdict: suspicious activity\nwraith: target exit: 0\n",
+        "raw_stdout": "{\"schema_version\":2,\"sensor_version\":\"0.2.0\",\"ts_ns\":1790830881676675722,\"pid\":18807,\"severity\":\"HIGH\",\"kind\":\"wx_violation\",\"syscall\":\"mprotect\",\"rip\":\"0x7fd92f6edee9\",\"rsp\":\"0x7fd92dcc9be8\",\"origin\":\"0x7fd92f80f000\",\"detail\":\"`mprotect` requests writable+executable memory \u2014 classic shellcode staging\"}\n{\"schema_version\":2,\"sensor_version\":\"0.2.0\",\"ts_ns\":1790830881706924097,\"pid\":18807,\"severity\":\"HIGH\",\"kind\":\"wx_violation\",\"syscall\":\"mmap\",\"rip\":\"0x7fd92f6ed5ea\",\"rsp\":\"0x7fd92dcc9470\",\"origin\":\"0x7fd917ee4000\",\"detail\":\"`mmap` requests writable+executable memory \u2014 classic shellcode staging\"}\n{\"schema_version\":2,\"sensor_version\":\"0.2.0\",\"ts_ns\":1790830881707436871,\"pid\":18807,\"severity\":\"HIGH\",\"kind\":\"wx_violation\",\"syscall\":\"mmap\",\"rip\":\"0x7fd92f6ed5ea\",\"rsp\":\"0x7fd92dcc9470\",\"origin\":\"0x7fd9109ad000\",\"detail\":\"`mmap` requests writable+executable memory \u2014 classic shellcode staging\"}\n{\"schema_version\":2,\"sensor_version\":\"0.2.0\",\"ts_ns\":1790830881707939322,\"pid\":18807,\"severity\":\"HIGH\",\"kind\":\"wx_violation\",\"syscall\":\"mmap\",\"rip\":\"0x7fd92f6ed5ea\",\"rsp\":\"0x7fd92dcc9470\",\"origin\":\"0x7fd918476000\",\"detail\":\"`mmap` requests writable+executable memory \u2014 classic shellcode staging\"}\n",
+        "sensor_exit_code": 1,
+        "severity_counts": {
+          "HIGH": 4
+        },
+        "target_completion_verified": true,
+        "target_exit_code": 0,
+        "target_signal": null,
+        "timed_out": false,
+        "wall_seconds": 1.0866471669996827
+      },
+      "version": {
+        "status": 0,
+        "text": "openjdk version \"21.0.12\" 2026-07-21\nOpenJDK Runtime Environment (build 21.0.12+8-1-24.04-Ubuntu)\nOpenJDK 64-Bit Server VM (build 21.0.12+8-1-24.04-Ubuntu, mixed mode, sharing)"
+      }
+    }
+  ],
+  "kind": "finite_benign_runtime_controls",
+  "limits": [
+    "PATH discovery only; no runtimes installed and no Windows executable run",
+    "one baseline and one observed sample per available runtime, not a false-positive population estimate",
+    "Java source-file compilation/startup is included; Node has an owned worker and JIT-capable computation",
+    "HIGH/CRITICAL benign-policy findings, operational failures and unsuccessful targets are reported separately",
+    "status/event summaries cannot prove complete coverage; no_reported_coverage_gaps describes reported events only, and is null for untraced baselines"
+  ],
+  "metadata": {
+    "cpu_model": "AMD Ryzen 7 7800X3D 8-Core Processor",
+    "environment": "WSL (not native Linux)",
+    "kernel": "5.15.167.4-microsoft-standard-WSL2",
+    "logical_cpus": 8,
+    "machine": "x86_64",
+    "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "policy": {
+      "enforcement": "observe",
+      "jit_critical": false,
+      "mode": "run",
+      "output": "--quiet --json -",
+      "stack_pivot": "default",
+      "trust_regions": []
+    },
+    "python_version": "3.12.3",
+    "recorded_at_utc": "2026-10-01T05:01:06.486471+00:00",
+    "rust_toolchain": {
+      "status": 0,
+      "text": "rustc 1.97.0 (2d8144b78 2026-07-07)\nbinary: rustc\ncommit-hash: 2d8144b7880597b6e6d3dfd63a9a9efae3f533d3\ncommit-date: 2026-07-07\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0\nLLVM version: 22.1.6"
+    },
+    "sensor": {
+      "path": "$ROOT/target/release/wraith",
+      "sha256": "6f038dbda437287511b7da0d65c9d85d21d37066aba6860d3e78b6f83a89939b",
+      "version": "wraith 0.2.0"
+    },
+    "source": {
+      "evidence_program_sha256": "fc939c83bbc6535d4aa1be60ed9a1c364de81f0aea73c930c91ffb61852a6cf2",
+      "head_commit": "ca2189859ba9a90f8f0a1321ca0e652d947bb1a9",
+      "input_sha256": {
+        "Cargo.lock": "80ea7dfc3f496b654077793e56176bea8a7d4956b7f38ccf6e0776867adba8df",
+        "Cargo.toml": "cdf584abef7d729326ff2e39f7f91579a2fba6ab33bcd53430490985c0821065",
+        "src/bin/benign.rs": "3ffabad910b8fd49cebae9a3238a5364b37b7055beecce2f21daa60d0ae45b47",
+        "src/bin/benign_threads.rs": "9eb20f9d790cebdd5393dab190f62549f4b147d139261b008052780a6a817fc0",
+        "src/bin/mt_shellcode_sim.rs": "b0f1f369768f72f5b5cdf07a3fdb9437833f886cdbb1dba17f95ccc1ae8161bd",
+        "src/bin/shellcode_sim.rs": "22df614f56e18e10948b4c9698171cc2bf1656431a96d3b7bf9394d1fbf10927",
+        "src/bin/wraith.rs": "a70f6d69660bdb2f8f09ae6f0f8429bde340a88ec48d22ca7fbd3ffd6427ea2c",
+        "src/detect.rs": "32e73dfee04e3146d9aeb395afc72278778e8f47607b4d11864464f2fe44e7d2",
+        "src/doctor.rs": "4351f22cd571432305d232805ea1b80254293ef63269b2cb43d50856ac58537a",
+        "src/engine.rs": "fe8bf2ee1032d859832375bb1892b1a081f14d39a3f32b240618cbc5855c9592",
+        "src/event.rs": "3b22fe8da3c5786f1fa0643428184bcecd9a1e785b8965f5e940169fec61c77b",
+        "src/lib.rs": "0fdf1bba23a6690d0cfc01e43e1073be6f0dc2e732afaddf0bb868f5854028b0",
+        "src/maps.rs": "bd31ab3b25162a9bce4fd3687bc0c23bc1ce0adfc5435c90e0b9a947fa3d9e0c",
+        "src/provenance.rs": "27da189e59cae62d82302ef4461b9d375c2dd704e8e88364eb83a254798bf3bc",
+        "src/syscalls.rs": "ccd0f71acfcb6993b770355a3625225be3c49f9d78c78a273055eb32b277d92c",
+        "src/tracer.rs": "c6db454b4daa1c7909502fd274a2a32fcabd8eece1cfbd0ccf7d622cade4ae68",
+        "src/ui.rs": "3ad5b29e9e1c6c562b816c713df33b336ae64452b5962b251c34588b77a1c692"
+      },
+      "qualification": "observed Rust/build-input snapshot at measurement time; HEAD alone is not the built source and this is not compiler attestation",
+      "rust_input_snapshot_sha256": "40181260f6d6964717d7380d440c49c0494aa418c09af7f4b089be2be30b82cf",
+      "working_tree_dirty": true
+    }
+  }
+}

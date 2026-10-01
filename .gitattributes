@@ -7,3 +7,5 @@
 *.sh text eol=lf
 .githooks/* text eol=lf
 *.py text eol=lf
+# Debian metadata and roff manuals must retain Unix line endings.
+packaging/** text eol=lf

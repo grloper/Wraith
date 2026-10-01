@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Maintained investigation foundations
+
+- Make required-map coverage failures visible, discard stale decision caches and
+  return operational code 2 even after recovery or output filtering.
+- Correlate actual successful protection/positive-input exits with bounded,
+  expiring address-span evidence; keep invalidating maps after partial failures.
+- Enroll successfully observed native per-thread signal stacks for placement only;
+  preserve executable-origin checks and conservative unknown/inherited cases.
+- Bound retired process rows, retain live rows/aggregate counters and reset reused IDs.
+- Isolate waits across creator OS threads with real concurrent/unrelated-child controls.
+- Add owned-child `doctor` preflight, configurable evidence/history bounds and
+  schema-2 event metadata with terminal-safe explanations.
+- Distinguish handled signal-delivery stops from confirmed fatal termination;
+  do not report ordinary JVM signal handling as HIGH crash evidence.
+- Create new JSONL evidence files owner-only without altering existing log permissions.
+- Add strict bounded JSONL triage, real HTTP/SQLite timing and legal-runtime controls.
+- Build actual amd64 `.deb` artifacts without privilege/service activation; select
+  Cargo's real executable paths, reject stale same-version canaries, and verify
+  extraction, dependencies, permissions, manifests and fixed-input reproducibility.
+- Publish primary-source Linux/Kali comparisons and explicit deployment/pilot gates.
+
+These are development capabilities, not a finalized endpoint product or a
+population-wide detection/performance guarantee. Event-schema revisions do not
+rename the project.
+
 ### Detection accuracy and safety
 
 - Classify named anonymous mappings as anonymous instead of trusting square brackets.

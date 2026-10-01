@@ -36,6 +36,7 @@ compile_error!(
 );
 
 pub mod detect;
+pub mod doctor;
 pub mod engine;
 pub mod event;
 pub mod maps;

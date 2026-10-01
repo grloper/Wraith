@@ -18,11 +18,10 @@ use wraith::detect::Config;
 use wraith::event::{Event, Kind, Severity};
 use wraith::tracer::{ProcStat, Reporter, Summary, Tracer};
 
-/// The tracer reaps its whole process tree with `waitpid(-1)`, which is exactly
-/// right for the real sensor (a dedicated process with a single tracer) but
-/// means two engines cannot run concurrently inside one process. `cargo test`
-/// runs these cases in parallel threads of one binary, so we serialize them
-/// through this lock; each trace runs start-to-finish before the next begins.
+/// Ordinary fixture lifecycles remain serialized. The backend scopes waits to
+/// the creating OS thread, but unrelated children on that same thread are still
+/// unsafe. Dedicated isolation regressions explicitly run separate creator /
+/// driver pairs concurrently while holding this outer fixture lock.
 fn trace_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -98,6 +97,250 @@ impl Drop for Fixture {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+fn lifecycle_fixture_bin() -> &'static std::path::Path {
+    use std::process::Command;
+    static BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        // The tracer uses waitpid(-1): serialize compiler children too, not just
+        // traced fixtures, so it cannot reap cc while Command::status waits.
+        let _guard = trace_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "wraith-provenance-lifecycle-{}",
+            std::process::id()
+        ));
+        assert!(Command::new("cc")
+            .args(["-pthread", "tests/fixtures/provenance_lifecycle.c", "-o"])
+            .arg(&path)
+            .status()
+            .expect("lifecycle fixture requires C compiler")
+            .success());
+        path
+    })
+    .as_path()
+}
+
+#[test]
+fn tracer_preserves_untraced_children_owned_by_another_os_thread() {
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _guard = trace_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 37"])
+            .spawn()
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        // Child::wait deliberately starts only after tracing completes. This
+        // exposes a backend that steals a sibling OS thread's wait status.
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        let _ = result_tx.send(child.wait());
+    });
+    ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let tracer = Tracer::spawn(&["/bin/sleep".into(), "0.08".into()], Config::default()).unwrap();
+    let traced = tracer.run(|_: &Event| {});
+    release_tx.send(()).unwrap();
+    let unrelated = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    owner.join().unwrap();
+    assert_eq!(traced.unwrap().exit_code, Some(0));
+    assert_eq!(
+        unrelated
+            .expect("tracer must not steal the unrelated child's wait status")
+            .code(),
+        Some(37)
+    );
+}
+
+#[test]
+fn independent_tracers_on_separate_os_threads_keep_their_own_outcomes() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let _guard = trace_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut starts = Vec::new();
+    let mut workers = Vec::new();
+    for expected in [17, 23] {
+        let ready = ready_tx.clone();
+        let results = result_tx.clone();
+        let (start_tx, start_rx) = mpsc::channel();
+        starts.push(start_tx);
+        workers.push(std::thread::spawn(move || {
+            let args = [
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("sleep 0.08; exit {expected}"),
+            ];
+            let tracer = Tracer::spawn(&args, Config::default()).unwrap();
+            ready.send(()).unwrap();
+            if start_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                let _ = results.send((expected, tracer.run(|_: &Event| {})));
+            }
+        }));
+    }
+    for _ in 0..2 {
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    for start in starts {
+        start.send(()).unwrap();
+    }
+    let results: Vec<_> = (0..2)
+        .map(|_| result_rx.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    for (expected, result) in results {
+        let summary = result.expect("one tracer must not consume another tracer's stop");
+        assert_eq!(summary.exit_code, Some(expected));
+        assert_eq!(summary.term_signal, None);
+        assert!(summary.syscalls_seen > 0);
+    }
+}
+
+#[test]
+fn handled_memory_signal_is_advisory_not_a_confirmed_crash() {
+    let Some((events, summary)) = trace_args(
+        &[
+            lifecycle_fixture_bin().display().to_string(),
+            "handled-segv".into(),
+        ],
+        Config::default(),
+    ) else {
+        return;
+    };
+    assert_eq!(summary.exit_code, Some(0));
+    assert_eq!(summary.term_signal, None);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == Kind::Crash || event.severity >= Severity::High),
+        "delivery alone cannot prove a crash or memory corruption: {events:?}"
+    );
+    assert!(events
+        .iter()
+        .any(|event| event.kind.as_str() == "signal_delivery" && event.severity == Severity::Info));
+}
+
+#[test]
+fn unhandled_memory_signals_emit_confirmed_terminal_crash() {
+    for (mode, signal) in [
+        ("fatal-segv", libc::SIGSEGV),
+        ("fatal-fpe", libc::SIGFPE),
+        ("fatal-ill", libc::SIGILL),
+        ("fatal-bus", libc::SIGBUS),
+        ("fatal-abrt", libc::SIGABRT),
+        ("threaded-fatal", libc::SIGSEGV),
+    ] {
+        let Some((events, summary)) = trace_args(
+            &[lifecycle_fixture_bin().display().to_string(), mode.into()],
+            Config::default(),
+        ) else {
+            return;
+        };
+        assert_eq!(summary.exit_code, None);
+        assert_eq!(summary.term_signal, Some(signal));
+        let crashes: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == Kind::Crash)
+            .collect();
+        assert_eq!(crashes.len(), 1, "one confirmed fatal outcome: {events:?}");
+        assert_eq!(crashes[0].severity, Severity::High);
+        assert!(
+            crashes[0].detail.contains("terminated"),
+            "must describe a terminal outcome, not just delivery"
+        );
+        assert!(
+            !crashes[0].detail.contains("memory-corruption"),
+            "signal number cannot establish cause"
+        );
+    }
+}
+
+#[test]
+fn registered_heap_altstack_is_a_benign_control() {
+    let Some((events, summary)) = trace_args(
+        &[
+            lifecycle_fixture_bin().display().to_string(),
+            "altstack".into(),
+        ],
+        Config::default(),
+    ) else {
+        return;
+    };
+    assert_eq!(summary.exit_code, Some(0));
+    assert_eq!(summary.term_signal, None);
+    assert!(
+        !events.iter().any(|event| event.kind == Kind::StackPivot),
+        "kernel-registered alternate stack is not a heap pivot: {events:?}"
+    );
+}
+
+#[test]
+fn failed_input_and_expired_staging_do_not_fabricate_strict_rx_chain() {
+    let Some((events, summary)) = trace_args(
+        &[
+            lifecycle_fixture_bin().display().to_string(),
+            "failed-input".into(),
+        ],
+        Config {
+            jit_is_critical: true,
+            ..Config::default()
+        },
+    ) else {
+        return;
+    };
+    assert_eq!(summary.exit_code, Some(0));
+    assert_eq!(summary.term_signal, None);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == Kind::ForeignOriginSyscall
+                && event.severity == Severity::Critical),
+        "explicit strict RX policy must remain active: {events:?}"
+    );
+    assert!(!events.iter().any(|event| event.kind == Kind::ExploitationChain),
+        "expired staging, EBADF receive and zero-byte read cannot fabricate successful milestones: {events:?}");
+}
+
+#[test]
+fn failed_mprotect_still_observes_its_partial_permission_change() {
+    let Some((events, summary)) = trace_args(
+        &[
+            lifecycle_fixture_bin().display().to_string(),
+            "partial".into(),
+        ],
+        Config::default(),
+    ) else {
+        return;
+    };
+    assert_eq!(
+        summary.exit_code,
+        Some(0),
+        "fixture must execute after ENOMEM partial mutation"
+    );
+    assert_eq!(summary.term_signal, None);
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == Kind::ForeignOriginSyscall
+                && event.severity == Severity::Warn),
+        "partial failure must still invalidate maps and reveal the RX anonymous origin: {events:?}"
+    );
+    assert!(!events
+        .iter()
+        .any(|event| event.kind == Kind::ExploitationChain));
 }
 
 fn fixture_bin() -> &'static std::path::Path {

@@ -112,7 +112,10 @@ impl StackState {
 /// This is a heuristic: ordinary thread stacks use anonymous mappings, which
 /// we accept as normal. Heap/file-backed stacks are flagged as potential pivots,
 /// although sigaltstack, context switching, and custom runtimes may use them
-/// legitimately. This classification does not track stack registration.
+/// legitimately. This stateless classifier does not track registration itself;
+/// Detector separately exempts exact per-thread extents from observed successful
+/// sigaltstack calls. Registrations predating attachment and unobserved inherited
+/// stacks remain limitations of the optional heuristic, not trusted heap code.
 pub fn classify_rsp(map: &MemoryMap, rsp: u64) -> StackState {
     let Some(region) = map.region_at(rsp) else {
         return StackState::Unmapped;

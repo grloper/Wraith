@@ -1,0 +1,145 @@
+.TH WRAITH 1 "" "Wraith" "User Commands"
+.SH NAME
+wraith \- inspect syscall provenance for selected Linux processes
+.SH SYNOPSIS
+.B wraith doctor
+.RB [ --json ]
+.br
+.B wraith run
+.RI [ options ] " -- program " [ arguments ...]
+.br
+.B wraith attach
+.RI [ options ] " pid"
+.br
+.B wraith scan
+.RI [ options ]
+.RB ( --match
+.I substring
+.RB | --all )
+.SH DESCRIPTION
+Wraith is a native Linux x86-64 runtime sensor implemented in Rust. It uses
+ptrace syscall stops and procfs mappings to inspect executable origins,
+protection requests and optional stack placement, and correlates those signals
+within a process address space. Observe-only is the default.
+.PP
+A clean verdict means no configured signal was observed, not that a process
+is uncompromised. JIT engines, alternate stacks and other legitimate runtimes
+can resemble injection. Review representative benign behavior before enforcement.
+File-backed code reuse and data-only attacks can evade origin-based rules.
+.SH COMMANDS
+.TP
+.B doctor
+Check native platform, procfs and actual ptrace operation on an owned child;
+report Yama policy. Use --json for a machine-readable readiness report.
+.TP
+.B run
+Launch a foreground program, following its threads and descendants.
+The program and its arguments follow --.
+.TP
+.B attach
+Attach to a running process and its existing thread group, subject to the
+permissions already enforced by Linux.
+.TP
+.B scan
+Attach to matching processes. Select --match or --all explicitly; prefer a
+small --max-targets value rather than tracing an entire busy host.
+.SH OPTIONS
+.TP
+.B --json FILE
+Append JSONL detections to FILE. A dash writes JSON to stdout; in run mode,
+target stdout is routed to stderr to keep the evidence stream machine-readable.
+For doctor, --json takes no file argument and prints its readiness report.
+.TP
+.B --min SEVERITY
+Report info, warn, high or critical events at or above the selected floor.
+This filters output, not the detector, enforcement or final verdict.
+.TP
+.B --correlation-window NUMBER
+Set the syscall-event correlation window from 1 to 1000000; the default is 64.
+Correlation also has a 30-second wall-clock time-to-live. This bound controls
+signal aging, not a guarantee that every exploitation chain is detected.
+.TP
+.B --max-history NUMBER
+Retain at most 0 to 10000 exited-process histories; the default is 128.
+Active process state is always retained. A value of zero disables retired history,
+not monitoring or current detections.
+.TP
+.B --jit-critical
+Select an explicit no-JIT policy. Default anonymous RX execution and W-to-X
+transitions are warnings; this policy can elevate them. Do not enable blindly
+for legitimate runtime-generated code.
+.TP
+.B --trust-region START-END
+Exempt an operator-vouched half-open hexadecimal address interval. A trust
+range is an intentional coverage gap, not attestation. Protection exemptions
+must cover the effective ordinary page-rounded span. Huge-page arenas require
+additional care and should not be trusted through these exemptions.
+.TP
+.B --no-stack-pivot
+Disable the custom-stack-sensitive placement heuristic.
+.TP
+.B --audit-sensitive
+Log sensitive syscalls from accepted executable origins as informational events.
+.TP
+.B --block
+On a critical event, skip the offending syscall so it returns ENOSYS.
+.TP
+.B --kill
+On a critical event, terminate the traced process tree. Mutually exclusive
+with --block. Failed enforcement may trigger fail-closed termination.
+.TP
+.B --match SUBSTRING
+In scan mode, select process names or command lines containing SUBSTRING.
+.TP
+.B --max-targets NUMBER
+Limit the number of selected scan targets.
+.TP
+.B --all
+In scan mode, explicitly select all processes the tracer is allowed to attach to.
+.TP
+.B --ui
+Use the live terminal dashboard.
+.TP
+.B --quiet
+Suppress human detection lines. Diagnostic errors and final outcomes remain visible.
+.TP
+.BR --version , " -V"
+Print the package's upstream version.
+.TP
+.BR --help , " -h"
+Print command help.
+.SH EXIT STATUS
+For monitoring commands, 0 means no high/critical event, 1 means high activity,
+2 means usage/tracing/evidence-output failure, and 3 means critical activity.
+The root target's exit or signal is reported separately; it does not replace
+the sensor exit policy. Mapping coverage failures are operational failures and
+yield status 2 even when coverage subsequently recovers. Output severity filtering
+does not erase an observed coverage failure or convert it into a clean verdict.
+.PP
+Doctor returns 0 when owned-child tracing and required platform/procfs checks
+are usable, or 2 for failed readiness or usage. An unhealthy JSON report does
+not by itself mean package installation failed.
+.SH REQUIREMENTS AND LIMITS
+Linux kernel 5.3 or newer on native amd64, mounted procfs and appropriate
+ptrace permission are required. 32-bit and x32 tracees are unsupported.
+Every syscall pays stop/resume overhead. This is focused monitoring, not
+low-overhead whole-host telemetry or a complete endpoint product.
+.PP
+Launched targets use EXITKILL; unexpected tracer death kills its owned tree.
+Unsupported launched job-control group stops return an operational error rather
+than being silently bypassed. Use service/foreground workflows, not transparent
+interactive job control. Attached targets do not receive automatic capabilities
+or changes to system security policy from this package.
+.SH FILES
+.TP
+.I /usr/share/doc/wraith/README.Debian
+Package-specific setup, deployment boundaries and evidence scope.
+.TP
+.I /usr/share/doc/wraith/copyright
+License and upstream copyright information.
+.SH SEE ALSO
+.BR ptrace (2),
+.BR proc (5),
+.BR dpkg-deb (1)
+.PP
+https://github.com/grloper/Wraith

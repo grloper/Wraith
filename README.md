@@ -35,6 +35,11 @@ Injected code can change its bytes. It still has to execute somewhere. Wraith us
 memory, inspect W^X requests, and correlate signals across threads. No payload signatures,
 cloud service, or model required. Only two direct Rust dependencies: `nix` and `libc`.
 
+**Continuously developed, not a finalized endpoint product.** The focus is reproducible
+Linux security investigation with honest coverage and workload evidence—not an antivirus
+or Nmap replacement. See the [development program](docs/product-program.md) and
+[Linux/Kali tool comparison](docs/tool-comparison.md).
+
 <table>
 <tr>
 <td width="33%"><strong>Inspect the origin</strong><br><sub>Executable mappings and syscall provenance. No payload signature required.</sub></td>
@@ -68,6 +73,7 @@ child process. WSL2 works; restricted containers may deny `ptrace`.
 git clone https://github.com/grloper/Wraith.git
 cd Wraith
 cargo build --release --locked
+./target/release/wraith doctor
 bash demo.sh
 ```
 
@@ -84,6 +90,24 @@ The demo checks **six outcomes**, rather than merely printing expected results:
 
 These are **safe local behavior simulators**, not exploitation of a real vulnerability:
 the payload opens a socket and closes it; it does not connect or exfiltrate data.
+
+## Install a Linux package
+
+On a Debian-family amd64 development machine, build and validate a sensor-only package:
+
+```bash
+bash scripts/test_deb.sh
+sudo apt install ./target/dist/wraith_0.2.0-1_amd64.deb
+wraith doctor --json
+```
+
+Building requires `dpkg-dev`, Python 3 and the Rust toolchain. Installation uses the
+ELF dependencies derived from the build system; incompatible older distributions
+must rebuild locally. No service, setuid bit, capability grant or security-policy
+change is installed. The validation gate inspects/extracts/executes the self-built
+package without changing the host package database. This is **not** official Kali
+inclusion or evidence of installation on every Linux distribution.
+See [Debian package guidance](packaging/README.Debian).
 
 ## Use it
 
@@ -116,9 +140,10 @@ program can have a clean sensor verdict. `--min` filters output, not detection o
 | Syscall from anonymous RX code, including named anonymous mappings | WARN; legitimate JIT is possible |
 | `mmap` / `mprotect` requests RWX | HIGH staging **request**, not proof the kernel accepted it |
 | Writable→executable transition | WARN by default (normal W^X JIT behavior); HIGH with explicit no-JIT policy |
-| Stack pointer in heap or a file mapping | HIGH heuristic; custom stacks can be legitimate |
-| Missing / non-executable origin in the map | Coverage uncertainty, not proof of injection |
-| Correlated anomalous sensitive execution and staging | CRITICAL chain under the configured origin policy |
+| Unregistered stack pointer in heap or a file mapping | HIGH heuristic; successfully observed per-thread signal-stack registrations affect placement only |
+| Missing / non-executable origin in a usable map | Coverage uncertainty, not proof of injection |
+| Required map refresh fails | Visible coverage gap; no enforcement from stale maps; sensor exit `2` |
+| Correlated anomalous sensitive execution and staging | CRITICAL under the current-origin policy; completed staging must cover that address, context expires by syscall budget/time; not proof of data flow |
 | Fatal target signal | HIGH crash indicator; crashes are not automatically attacks |
 
 **Anonymous RX is not automatically CRITICAL.** `--jit-critical` is an explicit
@@ -132,7 +157,15 @@ never trust broad ranges merely to make alerts disappear.
 
 `--no-stack-pivot` disables the custom-stack-sensitive heuristic.
 `--audit-sensitive` adds INFO breadcrumbs for sensitive calls from accepted code.
+`--correlation-window N` sets the evidence budget (default 64 syscall entries,
+also expiring after 30 seconds); `--max-history N` caps retired dashboard rows
+(default 128, with live rows preserved). Failed/zero-byte input does not count as
+completed input evidence; protection requests may still be reported even if they fail.
 See `wraith --help` and [operator guidance](docs/operations.md).
+
+JSONL events carry schema and sensor versions. A strict, bounded
+[triage helper and investigation workflows](docs/workflows.md) validate complete
+logs without treating a quiet/filtered stream as proof of complete coverage.
 
 ### Optional enforcement
 
@@ -168,7 +201,23 @@ not low-overhead whole-host telemetry. Measure your own workload:
 
 ```bash
 python3 scripts/benchmark.py --iterations 20000 --samples 5
+python3 scripts/benchmark_workloads.py --help
 ```
+
+Actual five-pair **WSL** wall timings (startup/import/shutdown included):
+
+| Owned workload | Baseline median | Traced median | Slowdown |
+|---|---:|---:|---:|
+| Loopback HTTP, 20 requests | 125.537 ms | 421.720 ms | 3.359× |
+| SQLite, 200 transactions | 564.563 ms | 1696.223 ms | 3.004× |
+
+[Raw samples and fingerprints](docs/benchmark-workloads-wsl.json) and
+[benign runtime controls](docs/runtime-controls-wsl.json) preserve target and sensor
+outcomes separately. Python was clean; Java completed with four HIGH RWX-policy
+findings, not fatal crashes; native Node was unavailable. This is no population
+false-positive or native-production performance claim. The historical
+[140.338× syscall-loop result](docs/benchmark-wsl.json) is a different workload,
+not a before/after speedup comparison.
 
 The script reports raw timings, kernel and median slowdown; it does not manufacture a
 performance claim. An eBPF backend is **not implemented**. Observation and synchronous
@@ -179,6 +228,7 @@ syscall blocking require different kernel mechanisms; see [research notes](docs/
 ```bash
 bash scripts/verify.sh        # formatting, Clippy, strict real-ptrace tests, docs
 cargo build --release --locked
+./target/release/wraith doctor
 bash demo.sh                 # asserted detection + enforcement demo
 ```
 
