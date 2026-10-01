@@ -24,7 +24,7 @@ jobs:
       WRAITH_REQUIRE_PTRACE: "1"
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install selected Rust toolchain
         run: |
           rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy --component rustfmt
