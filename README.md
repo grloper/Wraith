@@ -1,10 +1,30 @@
-<p align="center"><img src="docs/hero.svg" alt="Wraith — inspect the origin, not the payload" width="920"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/banner.png">
+    <img src="docs/banner.gif" alt="Wraith — a spectral form crossed by a slow provenance trace; execution leaves a trace" width="1200">
+  </picture>
+</p>
 
 <p align="center">
-  <a href="https://github.com/grloper/Wraith/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/grloper/Wraith/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="Platform: Linux x86-64" src="https://img.shields.io/badge/platform-Linux_x86--64-38bdf8">
-  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-5eead4"></a>
+  <strong>Runtime security, through a different lens.</strong><br>
+  <sub>Observe execution. Inspect its origin. Understand the anomaly.</sub>
 </p>
+
+<p align="center">
+  <a href="#try-it-in-two-minutes">Quickstart</a> &nbsp; / &nbsp;
+  <a href="#see-the-evidence">Real demo</a> &nbsp; / &nbsp;
+  <a href="#how-it-works">Design</a> &nbsp; / &nbsp;
+  <a href="docs/threat-model.md">Threat model</a> &nbsp; / &nbsp;
+  <a href="CONTRIBUTING.md">Contribute</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/grloper/Wraith/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/grloper/Wraith/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Platform: Linux x86-64" src="https://img.shields.io/badge/Linux-x86--64-20231d?style=flat-square&amp;labelColor=10120f">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-d3ef85?style=flat-square&amp;labelColor=10120f"></a>
+</p>
+
+<p align="center"><sub>Concept artwork, not telemetry. <a href="docs/banner.png">Still version</a> · <a href="docs/brand.md">Art direction &amp; motion</a></sub></p>
 
 # Wraith
 
@@ -14,6 +34,14 @@ Injected code can change its bytes. It still has to execute somewhere. Wraith us
 `ptrace` and `/proc/<pid>/maps` to flag sensitive syscalls from suspicious executable
 memory, inspect W^X requests, and correlate signals across threads. No payload signatures,
 cloud service, or model required. Only two direct Rust dependencies: `nix` and `libc`.
+
+<table>
+<tr>
+<td width="33%"><strong>Inspect the origin</strong><br><sub>Executable mappings and syscall provenance. No payload signature required.</sub></td>
+<td width="33%"><strong>Follow the execution</strong><br><sub>Shared process state across worker threads, with explicit exec lifecycle handling.</sub></td>
+<td width="33%"><strong>Keep the evidence</strong><br><sub>JSONL detections, a live terminal view, and opt-in response after baselining.</sub></td>
+</tr>
+</table>
 
 **For:** security researchers, focused service monitoring, exploit-behavior experiments,
 and fuzzing triage. **Not:** a complete EDR, a vulnerability scanner, or proof that a
@@ -33,7 +61,7 @@ The older [scan dashboard illustration](docs/scan-demo.svg) is illustrative, not
 
 ## Try it in two minutes
 
-Prerequisites: Linux x86-64, Rust 1.74+, mounted procfs, and permission to trace your own
+Prerequisites: Linux 5.3+ on x86-64, Rust 1.74+, mounted procfs, and permission to trace your own
 child process. WSL2 works; restricted containers may deny `ptrace`.
 
 ```bash

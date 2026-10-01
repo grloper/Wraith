@@ -10,5 +10,7 @@ cargo clippy --all-targets --locked -- -D warnings
 WRAITH_REQUIRE_PTRACE=1 timeout 180 cargo test --all-targets --locked
 cargo build --release --locked
 python3 scripts/check_docs.py
+python3 scripts/check_brand.py
+python3 scripts/test_brand.py
 bash -n demo.sh scripts/verify.sh scripts/package_release.sh .githooks/pre-commit
 printf '\nPASS: formatting, Clippy, strict tests, release build and documentation gates.\n'

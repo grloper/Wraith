@@ -28,16 +28,17 @@ measurements: https://github.com/grloper/Wraith
 
 ## 60-second walkthrough
 
-1. **0–10s:** explain syscall provenance with the hero diagram.
+1. **0–10s:** introduce the spectral identity, then explain syscall provenance;
+   the animated hero is concept artwork, not live telemetry.
 2. **10–25s:** run the benign control; show no detections.
 3. **25–40s:** run the local RWX simulator; explain origin plus correlation.
 4. **40–50s:** show `--block` returning `-ENOSYS` while the fixture survives.
 5. **50–60s:** state JIT/ROP and ptrace-cost limitations; invite reproducers.
 
 Use `bash demo.sh` and `python3 scripts/record_demo.py`. The portfolio-ready
-[PNG preview](social-preview.png) is rendered from the authored SVG; regenerate
-with `python3 scripts/render_preview.py` only if Playwright and Chromium are
-already installed (optional, not a sensor dependency). Publish the actual recording,
+[PNG preview](social-preview.png) uses the new generated spectral artwork;
+regenerate with `python3 scripts/render_brand.py` only if Pillow is already
+installed (optional, not a sensor dependency). See [art direction and accessibility](brand.md). Publish the actual recording,
 not a staged dashboard as if it were a live capture. A simulator demonstrates
 observable behavior, not a CVE exploitation success rate.
 

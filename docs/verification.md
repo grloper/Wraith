@@ -62,6 +62,25 @@ interpreted as cmd.exe syntax. Those three records remain blocked with the
 execution error preserved; quote-free V2 checks supersede them. No failed check
 was relabeled as a pass or manually closed.
 
+## Visual identity follow-up
+
+The new [spectral identity](brand.md) uses generated source art, locally composed
+typography and a lightweight GIF. The asset contract first failed on missing
+banner files, then passed with static/GIF/social assets and reduced-motion markup.
+The final GIF independently decoded as **47 frames, 46 distinct frames, 5.77 seconds,
+289,626 bytes**. It is concept artwork, not a fabricated runtime demo.
+
+Five standard-library Python regressions validate the real bundle, invalid PNG,
+truncated GIF trailer/control blocks and removal of reduced-motion markup. They
+now run alongside the unchanged **97 Rust tests** in `scripts/verify.sh`.
+Local Chromium previews validated desktop/mobile aspect ratio, no horizontal
+overflow, static selection under reduced motion and GIF selection otherwise.
+These previews are local approximations; hosted GitHub behavior is checked after
+publication rather than inferred from them. A separate verifier reran all three
+`WRAITH-BRAND` acceptance commands and approved it (hash `2e1fda4e8881dd94`),
+without authoring any implementation changes. That approval covers local assets
+and release gates, not the subsequent Git push or hosted rendering.
+
 ## RED/GREEN index
 
 | Guarantee | Regression target | Observed RED → GREEN |
