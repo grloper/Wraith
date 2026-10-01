@@ -81,6 +81,13 @@ publication rather than inferred from them. A separate verifier reran all three
 without authoring any implementation changes. That approval covers local assets
 and release gates, not the subsequent Git push or hosted rendering.
 
+The brand update was then pushed normally to `origin/main` at `c43a521`, with the
+remote SHA matched to local HEAD. Hosted Chromium checks on the actual GitHub
+repository confirmed the GIF loads by default, the PNG is selected under reduced
+motion, and the mobile image retains its 3:1 aspect ratio. The [hosted CI run](https://github.com/grloper/Wraith/actions/runs/36801849681)
+for that commit completed successfully, including the stable/MSRV matrix.
+No GitHub release tag or external promotional post was created.
+
 ## RED/GREEN index
 
 | Guarantee | Regression target | Observed RED → GREEN |
@@ -108,7 +115,9 @@ in shared working-tree scopes; the CLI/job-stop RED checkpoints are separate com
   the parser/policy regression tests exercise the newer-kernel map formats.
 - No population-wide false-positive rate has been established.
 - Line/branch coverage has not been measured; no 80% coverage claim is made.
-- No hosted GitHub Actions run or public release has been triggered by this work.
+- The original hardening delivery was local-only; the subsequent brand update was
+  pushed to main and verified by hosted CI as described above. No versioned public
+  release has been created.
 - Release artifacts remain locally verified until the maintainer tags and validates them.
 - Operator-visible job-control, unusual shared-mm and embedded-wait limitations remain
   documented in [operations](operations.md) and [the roadmap](roadmap.md).
