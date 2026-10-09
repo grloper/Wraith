@@ -97,13 +97,16 @@ enum SyscallStop {
     Exit { result: i64, is_error: bool },
 }
 
+/// `PTRACE_GET_SYSCALL_INFO` request number (Linux >= 5.3, `<linux/ptrace.h>`).
+const PTRACE_GET_SYSCALL_INFO: u32 = 0x420e;
+
 fn syscall_stop(pid: Pid) -> io::Result<SyscallStop> {
     let mut info = SyscallInfo::default();
     // GET_SYSCALL_INFO requires Linux >= 5.3. Never guess phase on older kernels:
     // an attached task's first stop may be an exit, where enforcement is unsafe.
     let size = unsafe {
         libc::ptrace(
-            0x420e,
+            PTRACE_GET_SYSCALL_INFO as _,
             pid.as_raw(),
             std::mem::size_of::<SyscallInfo>(),
             &mut info as *mut SyscallInfo,
@@ -943,6 +946,16 @@ fn nix_err(e: nix::errno::Errno) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_env = "gnu")]
+    #[test]
+    fn syscall_info_request_matches_libc() {
+        assert_eq!(
+            super::PTRACE_GET_SYSCALL_INFO,
+            libc::PTRACE_GET_SYSCALL_INFO
+        );
+        assert_eq!(super::PTRACE_GET_SYSCALL_INFO, 0x420e);
+    }
+
     use super::*;
 
     #[test]
