@@ -16,7 +16,7 @@ jobs:
       DEBFULLNAME: ${{ vars.DEBFULLNAME || 'grloper' }}
       DEBEMAIL: ${{ vars.DEBEMAIL }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Require maintainer identity
         run: |
           if [ -z "${DEBEMAIL}" ]; then
@@ -40,7 +40,7 @@ jobs:
       - name: Build and exercise Debian-family package without host installation
         run: |
           bash scripts/test_deb.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wraith-linux-x86_64
           path: |
@@ -61,7 +61,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
       - name: Validate tag matches package version
@@ -81,7 +81,7 @@ jobs:
       # download-artifact@v4 pairs with upload-artifact@v4 (same artifact backend)
       # used by the build job. If dependabot #12 bumps upload-artifact to v6,
       # bump this to download-artifact@v7 in the same change (v6 <-> v7, both node24).
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: wraith-linux-x86_64
           path: dist
