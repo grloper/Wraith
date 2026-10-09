@@ -16,7 +16,7 @@ jobs:
       DEBFULLNAME: ${{ vars.DEBFULLNAME || 'grloper' }}
       DEBEMAIL: ${{ vars.DEBEMAIL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Require maintainer identity
         run: |
           if [ -z "${DEBEMAIL}" ]; then
