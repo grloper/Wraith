@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned tool version; bump deliberately.
+  CARGO_CYCLONEDX_VERSION: "0.5.9"
+
 jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
@@ -40,6 +44,13 @@ jobs:
       - name: Build and exercise Debian-family package without host installation
         run: |
           bash scripts/test_deb.sh
+      - name: Generate CycloneDX SBOM (pinned cargo-cyclonedx)
+        run: |
+          set -euo pipefail
+          cargo install --locked --version "${CARGO_CYCLONEDX_VERSION}" cargo-cyclonedx
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename wraith-linux-x86_64.cdx
+          mv wraith-linux-x86_64.cdx.json target/dist/
+          jq -e '.bomFormat == "CycloneDX" and (.components | length > 0)' target/dist/wraith-linux-x86_64.cdx.json >/dev/null
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wraith-linux-x86_64
@@ -48,14 +59,37 @@ jobs:
             target/dist/SHA256SUMS
             target/dist/wraith_*_amd64.deb
             target/dist/DebSHA256SUMS
+            target/dist/wraith-linux-x86_64.cdx.json
           retention-days: 30
           if-no-files-found: error
+
+  attest:
+    # Build provenance for the tarball and .deb. Runs for tag pushes and for the
+    # workflow_dispatch dry run (artifact-only: nothing is released).
+    # id-token/attestations permissions are scoped to this job only.
+    needs: linux-x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: wraith-linux-x86_64
+          path: dist
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/wraith-linux-x86_64.tar.gz
+            dist/wraith_*_amd64.deb
 
   draft-release:
     # Only for tag pushes; workflow_dispatch remains an artifact-only dry run.
     # Creates a DRAFT release: a maintainer must review and publish it manually.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: linux-x86_64
+    needs: [linux-x86_64, attest]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -94,7 +128,7 @@ jobs:
           shopt -s nullglob
           debs=(wraith_*_amd64.deb)
           [ "${#debs[@]}" -eq 1 ] || { echo "::error::expected exactly one wraith_*_amd64.deb, found ${#debs[@]}"; exit 1; }
-          expected=$(printf '%s\n' DebSHA256SUMS SHA256SUMS wraith-linux-x86_64.tar.gz "${debs[0]}" | sort)
+          expected=$(printf '%s\n' DebSHA256SUMS SHA256SUMS wraith-linux-x86_64.cdx.json wraith-linux-x86_64.tar.gz "${debs[0]}" | sort)
           actual=$(find . -maxdepth 1 -type f -printf '%f\n' | sort)
           [ "$expected" = "$actual" ] || { echo "::error::unexpected dist contents"; diff <(echo "$expected") <(echo "$actual") || true; exit 1; }
       - name: Verify checksums before attaching
@@ -110,6 +144,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --draft --verify-tag \
             --title "$GITHUB_REF_NAME" \
-            --notes "Draft release for $GITHUB_REF_NAME. Review CHANGELOG.md and SECURITY.md before publishing. Verify downloads with the attached checksums." \
+            --notes "Draft release for $GITHUB_REF_NAME. Review CHANGELOG.md and SECURITY.md before publishing. Verify downloads with the attached checksums or with gh attestation verify (build provenance); a CycloneDX SBOM is attached." \
             dist/wraith-linux-x86_64.tar.gz dist/wraith_*_amd64.deb \
-            dist/SHA256SUMS dist/DebSHA256SUMS
+            dist/SHA256SUMS dist/DebSHA256SUMS dist/wraith-linux-x86_64.cdx.json
