@@ -57,3 +57,10 @@ post vulnerabilities in public issues; see [SECURITY.md](SECURITY.md).
 A false-positive report should include the Wraith version, kernel, invocation,
 minimal benign reproducer and redacted events. A performance report should include
 baseline and traced timings, sample count, workload and hardware—not only a ratio.
+
+## CI maintainer identity
+
+The Debian package gate requires a real maintainer contact. CI reads the
+repository variables `DEBEMAIL` (required) and `DEBFULLNAME` (defaults to
+`grloper`), set under Settings > Secrets and variables > Actions > Variables.
+For local runs, export `DEBEMAIL` and `DEBFULLNAME` before `scripts/verify.sh`.
