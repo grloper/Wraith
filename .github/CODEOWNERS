@@ -1,0 +1,7 @@
+# Default owner for everything; security-sensitive paths listed explicitly.
+*                       @grloper
+/.github/               @grloper
+/src/                   @grloper
+/scripts/               @grloper
+/packaging/             @grloper
+/SECURITY.md            @grloper
