@@ -1,0 +1,44 @@
+name: coverage
+
+# Informational only: never blocks merges (continue-on-error on the job).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  llvm-cov:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install stable Rust with llvm-tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - name: Run tests with coverage
+        run: |
+          set -euo pipefail
+          cargo llvm-cov --locked --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 14
