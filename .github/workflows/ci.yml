@@ -23,6 +23,10 @@ jobs:
     env:
       WRAITH_REQUIRE_PTRACE: "1"
       CARGO_TERM_COLOR: always
+      # package_deb.sh otherwise derives maintainer identity from the HEAD commit
+      # author; dependabot[bot] fails its e-mail validation.
+      DEBFULLNAME: grloper
+      DEBEMAIL: ofekv9652@gmail.com
     steps:
       - uses: actions/checkout@v4
       - name: Install selected Rust toolchain
