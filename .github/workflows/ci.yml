@@ -23,8 +23,18 @@ jobs:
     env:
       WRAITH_REQUIRE_PTRACE: "1"
       CARGO_TERM_COLOR: always
+      # package_deb.sh otherwise derives maintainer identity from the HEAD commit
+      # author; dependabot[bot] fails its e-mail validation. Configure repo variable DEBEMAIL.
+      DEBFULLNAME: ${{ vars.DEBFULLNAME || 'grloper' }}
+      DEBEMAIL: ${{ vars.DEBEMAIL }}
     steps:
       - uses: actions/checkout@v4
+      - name: Require maintainer identity
+        run: |
+          if [ -z "${DEBEMAIL}" ]; then
+            echo "::error::Set repository variable DEBEMAIL (Settings > Secrets and variables > Actions > Variables)"
+            exit 1
+          fi
       - name: Install selected Rust toolchain
         run: |
           rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy --component rustfmt

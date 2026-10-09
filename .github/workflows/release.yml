@@ -12,8 +12,17 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    env:
+      DEBFULLNAME: ${{ vars.DEBFULLNAME || 'grloper' }}
+      DEBEMAIL: ${{ vars.DEBEMAIL }}
     steps:
       - uses: actions/checkout@v4
+      - name: Require maintainer identity
+        run: |
+          if [ -z "${DEBEMAIL}" ]; then
+            echo "::error::Set repository variable DEBEMAIL (Settings > Secrets and variables > Actions > Variables)"
+            exit 1
+          fi
       - name: Install stable Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
