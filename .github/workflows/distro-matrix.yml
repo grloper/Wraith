@@ -21,43 +21,64 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "fedora:latest"]
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "fedora:43"]
     container:
       image: ${{ matrix.image }}
       # ptrace in containers can be restricted by the seccomp profile/capabilities.
       options: --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    defaults:
+      run:
+        shell: bash
     env:
       CARGO_TERM_COLOR: always
+      RUSTUP_VERSION: "1.29.1"
+      # sha256 of rustup-init for x86_64-unknown-linux-gnu at RUSTUP_VERSION
+      RUSTUP_INIT_SHA256: "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71"
+      MSRV_TOOLCHAIN: "1.74.0"
     steps:
       - name: Install build prerequisites
         shell: sh
         run: |
+          set -eu
           if command -v apt-get >/dev/null; then
             apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev git python3
           else
             dnf install -y gcc curl git python3 ca-certificates
           fi
       - uses: actions/checkout@v4
-      - name: Install stable Rust
-        shell: sh
+      - name: Install pinned rustup, stable and MSRV toolchains
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          set -euo pipefail
+          url="https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          curl --proto '=https' --tlsv1.2 -sSfL -o rustup-init "$url"
+          echo "${RUSTUP_INIT_SHA256}  rustup-init" | sha256sum -c -
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain stable
+          rm rustup-init
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install "$MSRV_TOOLCHAIN" --profile minimal
       - name: Show environment
         run: |
           cat /etc/os-release | head -3
           rustc --version
           uname -r
       - name: Build (release, locked)
-        run: cargo build --release --locked
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+      - name: MSRV check (${{ env.MSRV_TOOLCHAIN }})
+        run: |
+          set -euo pipefail
+          cargo +"$MSRV_TOOLCHAIN" check --locked
       - name: Ptrace preflight (informational)
         # If the container forbids ptrace, ptrace-dependent integration tests
         # print "skipping: could not start tracer" and pass without exercising
         # tracing. This step makes that visible rather than hidden.
         run: ./target/release/wraith doctor || echo "::warning::wraith doctor reported failures on ${{ matrix.image }}; ptrace tests may be skipped"
       - name: Test
-        run: cargo test --locked -- --nocapture 2>&1 | tee test.log
-        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -- --nocapture 2>&1 | tee test.log
       - name: Report skipped ptrace tests
         if: always()
         shell: bash
