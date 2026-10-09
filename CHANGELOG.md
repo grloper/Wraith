@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-10-09
+
 ### Maintained investigation foundations
 
 - Make required-map coverage failures visible, discard stale decision caches and
@@ -56,6 +58,20 @@ rename the project.
 - Document the threat model, Linux research, operations, contribution workflow and launch kit.
 - Add strict Linux quality gates, MSRV CI matrix, package checks and sensor-only
   release artifacts with checksums. No automatic public publishing.
+
+### Supply chain and CI
+
+- Add Ubuntu 22.04/24.04, Debian 12 and Fedora 43 container build+test matrix,
+  a build-twice SHA-256 reproducibility check and a cargo-audit/cargo-deny workflow.
+- Pin all GitHub Actions to commit SHAs; set an explicit Debian maintainer identity
+  for the package gate.
+- Add CodeQL (Rust and Actions) and OpenSSF Scorecard workflows, plus an
+  informational cargo-llvm-cov coverage job.
+- Release workflow creates a DRAFT GitHub Release with the tarball, `.deb`,
+  checksums, a CycloneDX SBOM and build-provenance attestations; publishing stays manual.
+- Add property tests and a cargo-fuzz target for the `/proc` maps parser.
+- Document private vulnerability reporting; add CODEOWNERS and issue/PR templates.
+- Dependency updates: nix 0.31, libc 0.2.190.
 
 Pre-1.0 APIs and severity policy may change. Review the threat model before upgrading
 an enforcement deployment; a clean verdict is not proof of absence of exploitation.
