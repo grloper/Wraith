@@ -1,0 +1,67 @@
+name: distro-matrix
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container-build-test:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "debian:12", "fedora:latest"]
+    container:
+      image: ${{ matrix.image }}
+      # ptrace in containers can be restricted by the seccomp profile/capabilities.
+      options: --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Install build prerequisites
+        shell: sh
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev git python3
+          else
+            dnf install -y gcc curl git python3 ca-certificates
+          fi
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: sh
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Show environment
+        run: |
+          cat /etc/os-release | head -3
+          rustc --version
+          uname -r
+      - name: Build (release, locked)
+        run: cargo build --release --locked
+      - name: Ptrace preflight (informational)
+        # If the container forbids ptrace, ptrace-dependent integration tests
+        # print "skipping: could not start tracer" and pass without exercising
+        # tracing. This step makes that visible rather than hidden.
+        run: ./target/release/wraith doctor || echo "::warning::wraith doctor reported failures on ${{ matrix.image }}; ptrace tests may be skipped"
+      - name: Test
+        run: cargo test --locked -- --nocapture 2>&1 | tee test.log
+        shell: bash
+      - name: Report skipped ptrace tests
+        if: always()
+        shell: bash
+        run: |
+          n=$(grep -c 'skipping: could not start tracer' test.log || true)
+          echo "ptrace-skipped test count: $n"
+          if [ "$n" != 0 ]; then echo "::warning::$n ptrace tests were skipped on ${{ matrix.image }}"; fi
