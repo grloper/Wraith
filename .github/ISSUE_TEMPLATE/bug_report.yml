@@ -1,27 +1,37 @@
-name: Reproducible bug or false positive
-description: Report non-sensitive behavior with a minimal safe reproducer.
+name: Bug report
+description: Something behaves incorrectly (not a security vulnerability)
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
-      value: "For security bypasses or destructive issues, use SECURITY.md instead of public disclosure. Redact process metadata and secrets."
+      value: |
+        For security vulnerabilities, do NOT open a public issue. Use the private advisory flow described in SECURITY.md.
   - type: input
-    id: environment
+    id: version
     attributes:
-      label: Version and environment
-      description: Wraith revision/version, kernel, distribution and architecture
+      label: Wraith version (`wraith --version`)
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Distro, kernel (`uname -r`) and container/VM details
     validations:
       required: true
   - type: textarea
-    id: reproduce
+    id: steps
     attributes:
-      label: Minimal safe reproducer
-      description: Exact invocation and local benign fixture; no real secrets or live targets
+      label: Steps to reproduce
     validations:
       required: true
   - type: textarea
-    id: result
+    id: expected
     attributes:
-      label: Expected and actual behavior
-      description: Include redacted events, sensor status and target status
+      label: Expected vs actual behavior
     validations:
       required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `wraith doctor`
+      render: text
