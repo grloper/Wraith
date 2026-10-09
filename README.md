@@ -56,6 +56,33 @@ process is uncompromised. Read the [threat model](docs/threat-model.md) before e
 > representative benign baseline. Zero false positives and universal exploit coverage
 > are not promised.
 
+## What it checks
+
+At each syscall entry Wraith checks invariants that ordinary programs normally satisfy;
+a violation is a signal for review, not proof of exploitation:
+
+1. **Provenance** - the instruction issuing a sensitive syscall should sit in an accepted
+   executable mapping (file-backed code, vDSO). RWX, heap, stack or anonymous origins are flagged.
+2. **W^X** - requests for writable+executable memory and writable-to-executable
+   transitions are reported (JIT runtimes legitimately do the latter; see policy below).
+3. **Stack placement** - a stack pointer in the heap or a file mapping is a heuristic HIGH.
+
+It needs no payload signature, but it does not know the vulnerability either, so it only sees
+exploitation that produces one of these artifacts.
+
+## Limitations
+
+- **Not a complete EDR.** Pure ROP/JOP in accepted file-backed code, data-only attacks,
+  malicious shared libraries, memfd-backed images and map races are blind spots; see the
+  [threat model](docs/threat-model.md#blind-spots).
+- **ptrace cost.** Every traced syscall stops the target (measured 3x on two WSL workloads below);
+  suited to a few high-value targets, not whole-host monitoring.
+- **Legitimate JIT** (JVMs, browsers, .NET) executes from anonymous memory; expect WARN/HIGH
+  findings and baseline first. Do not use `--jit-critical` or enforcement without that.
+- **Tracing requirements.** Linux 5.3+ x86-64, native ABI only (x32 rejected), and permission
+  to trace the target (ownership/Yama/capabilities). Restricted containers may deny ptrace.
+- **Pre-1.0.** CLI, event schema and severity policy may change.
+
 ## See the evidence
 
 ![Actual Wraith fixture session: benign control, injection detection and syscall blocking](docs/demo.svg)
