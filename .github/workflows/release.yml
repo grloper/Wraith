@@ -43,7 +43,7 @@ jobs:
       - name: Build and exercise Debian-family package without host installation
         run: |
           bash scripts/test_deb.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wraith-linux-x86_64
           path: |
