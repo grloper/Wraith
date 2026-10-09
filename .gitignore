@@ -7,3 +7,7 @@
 /docs/demo-output/
 __pycache__/
 *.py[cod]
+/fuzz/target
+/fuzz/Cargo.lock
+/fuzz/corpus
+/fuzz/artifacts
