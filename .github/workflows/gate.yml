@@ -1,0 +1,48 @@
+name: Gate
+
+# Required status checks: `verify` and `test-integrity`.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      WRAITH_REQUIRE_PTRACE: "1"
+      CARGO_TERM_COLOR: always
+      DEBFULLNAME: ${{ vars.DEBFULLNAME || 'grloper' }}
+      DEBEMAIL: ${{ vars.DEBEMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          components: clippy, rustfmt
+      - name: scripts/verify.sh
+        run: scripts/verify.sh
+
+  test-integrity:
+    name: test-integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: scripts/check-test-integrity.sh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: origin/${{ github.base_ref }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: scripts/check-test-integrity.sh

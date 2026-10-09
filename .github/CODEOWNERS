@@ -5,3 +5,7 @@
 /scripts/               @grloper
 /packaging/             @grloper
 /SECURITY.md            @grloper
+/scripts/verify.sh      @grloper
+/scripts/check-test-integrity.sh @grloper
+/tests/                 @grloper
+/AGENTS.md              @grloper
