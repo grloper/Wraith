@@ -6,9 +6,13 @@ sensor, its trust ranges and its event destination as part of your security boun
 ## Reporting
 
 Do not disclose an unpatched bypass, memory-safety issue or destructive enforcement
-bug in a public issue. Use the repository's [private vulnerability reporting page](https://github.com/grloper/Wraith/security/advisories/new)
-if enabled. If unavailable, request a private reporting channel from the maintainer
-without including exploit details. No response-time or bounty guarantee is offered.
+bug in a public issue. Report it privately through GitHub's private vulnerability
+reporting: open the repository's **Security** tab and choose **Report a vulnerability**
+([direct link](https://github.com/grloper/Wraith/security/advisories/new)). This
+creates a private security advisory visible only to you and the maintainers.
+
+If that page is unavailable, open a public issue that asks for a private channel and
+contains no exploit details. No response-time or bounty guarantee is offered.
 
 Include the affected revision, Linux kernel, minimal safe reproducer, expected
 behavior, actual behavior and proposed regression. Do not send secrets or live
