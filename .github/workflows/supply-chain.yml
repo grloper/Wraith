@@ -1,0 +1,52 @@
+name: supply-chain
+
+on:
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "deny.toml", ".github/workflows/supply-chain.yml"]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned tool versions (latest releases at the time of writing; both install
+  # with --locked on current stable). Bump deliberately.
+  CARGO_AUDIT_VERSION: "0.22.2"
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Cache installed cargo tools
+        id: tools-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Cache cargo-deny
+        id: deny-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Install cargo-audit (pinned)
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
+      - name: Install cargo-deny (pinned)
+        if: steps.deny-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - name: cargo audit (RustSec advisories)
+        run: cargo audit
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny check

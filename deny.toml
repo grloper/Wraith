@@ -1,0 +1,35 @@
+# cargo-deny policy. Kept deliberately minimal; tighten as the project matures.
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Allow-list intentionally broader than the current tree; do not warn on unused entries.
+unused-allowed-license = "allow"
+# Permissive licenses only; extend deliberately (copyleft is not allowed).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+]
+
+[bans]
+# Duplicate crate versions are common in transitive trees (e.g. across a
+# dependabot bump) and are not a security problem by themselves: report them
+# as warnings (visible in CI logs) but do not fail the build.
+multiple-versions = "warn"
+# Wildcard version requirements ("*") in our own manifest are denied: every
+# dependency must have a bounded requirement so builds are reviewable.
+wildcards = "deny"
+# Path dependencies of the workspace itself are exempt.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
