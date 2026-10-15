@@ -51,7 +51,7 @@ jobs:
           cargo cyclonedx --format json --spec-version 1.5 --override-filename wraith-linux-x86_64.cdx
           mv wraith-linux-x86_64.cdx.json target/dist/
           jq -e '.bomFormat == "CycloneDX" and (.components | length > 0)' target/dist/wraith-linux-x86_64.cdx.json >/dev/null
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wraith-linux-x86_64
           path: |
